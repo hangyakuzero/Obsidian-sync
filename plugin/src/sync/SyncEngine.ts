@@ -1,4 +1,4 @@
-import { Change, fromBase64, MAX_FILE_BYTES, normalizePath } from "@syncvault/shared";
+import { Change, fromBase64, MAX_FILE_BYTES, normalizePath, toBase64 } from "@syncvault/shared";
 import { SyncState, QueuedChange } from "../state/SyncState";
 import { ChangeQueue } from "./ChangeQueue";
 import { VaultWatcher } from "../vault/VaultWatcher";
@@ -6,7 +6,7 @@ import { SyncConnection, ConnectionStatus, ConnectionCallbacks, Connection } fro
 import { HttpConnection } from "./HttpConnection";
 import { SyncClient } from "../api/SyncClient";
 
-export type SyncStatus = "idle" | "syncing" | "downloading" | "uploading" | "conflict" | "offline" | "synced";
+export type SyncStatus = "idle" | "syncing" | "downloading" | "uploading" | "conflict" | "offline" | "synced" | "paused";
 
 export interface VaultOps {
   write(path: string, data: Uint8Array): Promise<void>;
@@ -16,6 +16,7 @@ export interface VaultOps {
 
 export interface SeedScanner {
   listFiles(): Promise<{ path: string; size: number }[]>;
+  readBytes?(path: string): Promise<ArrayBuffer | null>;
 }
 
 export interface EngineOptions {
@@ -25,8 +26,13 @@ export interface EngineOptions {
   pollIntervalMs?: number;
 }
 
+type AckResult =
+  | { status: "accepted"; revision: number }
+  | { status: "conflict"; conflictPath?: string }
+  | { status: "rejected" };
+
 interface PendingAck {
-  resolve: (result: { accepted: true; revision: number } | { accepted: false; conflictPath?: string }) => void;
+  resolve: (result: AckResult) => void;
   timer: ReturnType<typeof setTimeout>;
 }
 
@@ -43,6 +49,7 @@ export class SyncEngine {
   private polling = false;
   private pollIntervalMs: number;
   private scanner?: SeedScanner;
+  private paused = false;
 
   constructor(
     private state: SyncState,
@@ -58,9 +65,11 @@ export class SyncEngine {
     const handlers: ConnectionCallbacks = {
       onWelcome: (serverRevision, resyncRequired) => this.handleWelcome(serverRevision, resyncRequired),
       onRemoteChange: (change) => void this.applyRemoteChange(change),
-      onAccepted: (operationId, revision) => this.settleAck(operationId, { accepted: true, revision }),
+      onAccepted: (operationId, revision) =>
+        this.settleAck(operationId, { status: "accepted", revision }),
       onConflict: (c) =>
-        this.settleAck(c.operationId, { accepted: false, conflictPath: c.conflictPath }),
+        this.settleAck(c.operationId, { status: "conflict", conflictPath: c.conflictPath }),
+      onRejected: (operationId, code, message) => this.handleRejected(operationId, code, message),
       onError: (message) => this.onNotice(`SyncVault: ${message}`, 6000),
       onStatusChange: (status) => this.handleConnectionStatus(status),
     };
@@ -89,6 +98,10 @@ export class SyncEngine {
     return this.queue.size();
   }
 
+  get isPaused(): boolean {
+    return this.paused;
+  }
+
   async start(): Promise<void> {
     if (!this.state.connected) return;
     this.connection.connect();
@@ -104,19 +117,35 @@ export class SyncEngine {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    this.paused = false;
     this.setStatus("idle");
   }
 
+  /**
+   * Resume after a pause (or simply trigger a sync round): clears the paused
+   * flag, (re)connects and runs one poll immediately.
+   */
+  async resume(): Promise<void> {
+    this.paused = false;
+    if (this.statusValue === "paused") this.setStatus("syncing");
+    if (this.pollTimer === null) {
+      this.pollTimer = setInterval(() => void this.pollOnce(), this.pollIntervalMs);
+    }
+    await this.syncNow();
+  }
+
   async syncNow(): Promise<void> {
-    if (!this.state.connected) {
+    if (!this.paused && !this.state.connected) {
       this.onNotice("SyncVault: not configured", 4000);
       return;
     }
+    this.paused = false;
     this.connection.connect();
     await this.pollOnce();
   }
 
   private async pollOnce(): Promise<void> {
+    if (this.paused) return;
     if (!this.state.connected) return;
     if (this.polling) return;
     if (!this.connection.connected) return;
@@ -176,7 +205,15 @@ export class SyncEngine {
       // scan never re-uploads them as local-only files.
       await this.state.markApplied(change.path, change.oldPath);
     } catch (e) {
-      this.onNotice(`SyncVault: failed to apply ${change.path}: ${(e as Error).message}`, 8000);
+      // Never ACK an unapplied change: the cursor stays put so the change is
+      // not lost. Instead of retrying forever, pause polling and surface a
+      // single notice — resume only after the underlying issue is fixed.
+      this.paused = true;
+      this.setStatus("paused");
+      this.onNotice(
+        `SyncVault: sync paused — could not apply "${change.path}": ${(e as Error).message}. Fix the issue, then resume sync (Settings → Resume).`,
+        10000,
+      );
       return;
     } finally {
       this.watcher.releaseAll();
@@ -211,6 +248,19 @@ export class SyncEngine {
       if (!this.syncablePath(f.path)) continue;
       if (this.state.hasApplied(f.path)) continue;
       if (f.size > MAX_FILE_BYTES) continue;
+      let payload: string | undefined;
+      if (this.scanner.readBytes) {
+        let bytes: ArrayBuffer | null;
+        try {
+          bytes = await this.scanner.readBytes(f.path);
+        } catch {
+          // scan is incomplete; retry on the next poll instead of marking seeded
+          return;
+        }
+        if (bytes === null) continue;
+        if (bytes.byteLength > MAX_FILE_BYTES) continue;
+        payload = toBase64(new Uint8Array(bytes));
+      }
       await this.queue.enqueue({
         operationId: this.newOperationId(),
         revision: 0,
@@ -219,6 +269,7 @@ export class SyncEngine {
         operation: "create",
         baseRevision: this.state.lastRevision,
         timestamp: Date.now(),
+        payload,
       });
     }
     await this.state.markSeeded();
@@ -269,8 +320,13 @@ export class SyncEngine {
         if (!this.connection.connected) break;
         const result = await this.sendAndWait(item);
         if (result === null) break;
+        if (result.status === "rejected") {
+          // permanently rejected (e.g. legacy payload-less seed) — already
+          // removed from the queue by handleRejected; do not advance the cursor
+          continue;
+        }
         await this.queue.remove(item.operationId);
-        if (result.accepted) {
+        if (result.status === "accepted") {
           await this.state.setLastRevision(result.revision);
         } else {
           // The server committed the conflicting version as a conflict copy and
@@ -286,7 +342,7 @@ export class SyncEngine {
 
   private sendAndWait(
     item: QueuedChange,
-  ): Promise<{ accepted: true; revision: number } | { accepted: false; conflictPath?: string } | null> {
+  ): Promise<AckResult | null> {
     if (!this.connection.connected) return Promise.resolve(null);
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
@@ -305,15 +361,23 @@ export class SyncEngine {
     });
   }
 
-  private settleAck(
-    operationId: string,
-    result: { accepted: true; revision: number } | { accepted: false; conflictPath?: string },
-  ): void {
+  private settleAck(operationId: string, result: AckResult): void {
     const pending = this.pendingAcks.get(operationId);
     if (!pending) return;
     clearTimeout(pending.timer);
     this.pendingAcks.delete(operationId);
     pending.resolve(result);
+  }
+
+  private handleRejected(operationId: string, code: string, message: string): void {
+    // Unblock any in-flight ack wait so the flush loop can move on immediately.
+    const pending = this.pendingAcks.get(operationId);
+    if (pending) this.settleAck(operationId, { status: "rejected" });
+    const item = this.queue.get(operationId);
+    if (item) {
+      void this.queue.remove(operationId);
+      this.onNotice(`SyncVault: skipped "${item.path}": ${message}`, 6000);
+    }
   }
 
   private setStatus(status: SyncStatus): void {

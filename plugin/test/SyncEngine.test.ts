@@ -4,7 +4,7 @@ import { ConnectionCallbacks } from "../src/sync/SyncConnection";
 import { ChangeQueue } from "../src/sync/ChangeQueue";
 import { VaultWatcher } from "../src/vault/VaultWatcher";
 import { SyncState, SyncStateBackend } from "../src/state/SyncState";
-import { Change, toBase64 } from "@syncvault/shared";
+import { Change, fromBase64, toBase64 } from "@syncvault/shared";
 
 class FakeConnection implements Connection {
   connected = true;
@@ -59,6 +59,7 @@ interface Rig {
   state: SyncState;
   queue: ChangeQueue;
   watcher: VaultWatcher;
+  vault: VaultOps;
   conn: FakeConnection;
   engine: SyncEngine;
   writes: { path: string; bytes: Uint8Array }[];
@@ -99,7 +100,7 @@ function makeRig(): Rig {
       return conn;
     },
   });
-  return { state, queue, watcher, conn: conn!, engine, writes, removes, renames };
+  return { state, queue, watcher, vault, conn: conn!, engine, writes, removes, renames };
 }
 
 describe("SyncEngine", () => {
@@ -233,6 +234,90 @@ describe("SyncEngine", () => {
     expect(rig.state.lastRevision).toBe(7);
     expect(rig.conn.acks).toEqual([7]);
     expect(rig.queue.size()).toBe(0);
+  });
+
+  it("seeds local files with their real payload content", async () => {
+    const rig = makeRig();
+    rig.engine["scanner"] = {
+      listFiles: async () => [
+        { path: "notes.md", size: 5 },
+        { path: "empty.md", size: 0 },
+      ],
+      readBytes: async (path) =>
+        path === "notes.md"
+          ? (new TextEncoder().encode("# hi").buffer as ArrayBuffer)
+          : new ArrayBuffer(0),
+    };
+    await rig.engine["maybeSeed"]();
+    expect(rig.queue.size()).toBe(2);
+    const notes = rig.queue.items.find((c) => c.path === "notes.md")!;
+    expect(notes.operation).toBe("create");
+    expect(Array.from(fromBase64(notes.payload!))).toEqual([...new TextEncoder().encode("# hi")]);
+    const empty = rig.queue.items.find((c) => c.path === "empty.md")!;
+    expect(empty.payload).toBe("");
+    expect(rig.state.seeded).toBe(true);
+  });
+
+  it("does not mark seeded when a file read fails mid-scan, and retries", async () => {
+    const rig = makeRig();
+    let failFirst = true;
+    rig.engine["scanner"] = {
+      listFiles: async () => [{ path: "a.md", size: 1 }, { path: "b.md", size: 1 }],
+      readBytes: async (path) => {
+        if (path === "b.md" && failFirst) {
+          failFirst = false;
+          throw new Error("transient read error");
+        }
+        return (new TextEncoder().encode("x").buffer as ArrayBuffer);
+      },
+    };
+    await rig.engine["maybeSeed"]();
+    // a.md was enqueued before the b.md read threw; seed stays incomplete
+    expect(rig.state.seeded).toBe(false);
+    expect(rig.queue.size()).toBe(1);
+    await rig.engine["maybeSeed"]();
+    expect(rig.state.seeded).toBe(true);
+    expect(rig.queue.size()).toBe(2);
+  });
+
+  it("pauses sync when a remote change cannot be applied", async () => {
+    const rig = makeRig();
+    rig.vault.write = async () => {
+      throw new Error("disk full");
+    };
+    rig.conn.handlers.onRemoteChange(
+      change({
+        operationId: "remote-broken",
+        revision: 4,
+        path: "x.md",
+        operation: "create",
+        payload: toBase64(new TextEncoder().encode("hi")),
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.engine.status).toBe("paused");
+    expect(rig.engine.isPaused).toBe(true);
+    // never ACK an unapplied change
+    expect(rig.state.lastRevision).toBe(3);
+    expect(rig.conn.acks).toEqual([]);
+    // resume clears the pause and resumes polling
+    await rig.engine.resume();
+    expect(rig.engine.isPaused).toBe(false);
+  });
+
+  it("drops a queued change rejected as unrecoverable and continues", async () => {
+    const rig = makeRig();
+    await rig.queue.enqueue(
+      change({ operationId: "op-legacy", path: "old.md", operation: "create" }),
+    );
+    const synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.conn.sent.length).toBe(1);
+    rig.conn.handlers.onRejected?.("op-legacy", "PAYLOAD_REQUIRED", "file content required");
+    await synced;
+    expect(rig.queue.size()).toBe(0);
+    // cursor does not move for a rejected upload
+    expect(rig.state.lastRevision).toBe(3);
   });
 
   it("seeds local files once, skipping applied, .obsidian and oversized paths", async () => {

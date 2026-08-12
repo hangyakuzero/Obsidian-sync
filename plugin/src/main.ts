@@ -15,6 +15,7 @@ const STATUS_ICONS: Record<SyncStatus, string> = {
   conflict: "SyncVault: ⚠ Conflict",
   offline: "SyncVault: ✕ Offline",
   synced: "SyncVault: ✓ Synced",
+  paused: "SyncVault: ⏸ Paused",
 };
 
 export default class SyncVaultPlugin extends Plugin {
@@ -52,7 +53,7 @@ export default class SyncVaultPlugin extends Plugin {
       rename: (oldPath, newPath) => this.app.vault.adapter.rename(oldPath, newPath),
     },
     (status) => this.setStatusBar(status),
-    (message, timeout) => new Notice(message, timeout ?? 5000),
+    (message, timeout) => this.notify(message, timeout),
     {
       client: this.client,
       scanner: {
@@ -66,11 +67,26 @@ export default class SyncVaultPlugin extends Plugin {
           );
           return stats;
         },
+        readBytes: async (path) => {
+          try {
+            return await this.app.vault.adapter.readBinary(path);
+          } catch {
+            return null;
+          }
+        },
       },
     },
   );
 
   private statusItem: HTMLElement | null = null;
+  private lastNoticeAt = new Map<string, number>();
+
+  private notify(message: string, timeout?: number): void {
+    const now = Date.now();
+    if ((this.lastNoticeAt.get(message) ?? 0) + 5000 > now) return;
+    this.lastNoticeAt.set(message, now);
+    new Notice(message, timeout ?? 5000);
+  }
 
   async onload(): Promise<void> {
     await this.state.load();

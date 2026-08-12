@@ -86,6 +86,14 @@ describe("accounts", () => {
       body: JSON.stringify({ accountId: "alice", password: "wrong" }),
     });
     expect(badPw.status).toBe(401);
+    // unknown username is distinguishable from a rejected password
+    const ghost = await SELF.fetch("http://localhost/v1/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: "ghost-user", password: PASSWORD }),
+    });
+    expect(ghost.status).toBe(404);
+    expect((await ghost.json<{ error: string }>()).error).toBe("NOT_FOUND");
   });
 });
 
@@ -197,6 +205,24 @@ describe("vault sync core", () => {
         deviceId,
       ),
     ).rejects.toThrow(/exceeds size limit/);
+  });
+
+  it("rejects payload-less create/update changes", async () => {
+    await createAccount("erin");
+    const vaultId = await createVault("erin", "V");
+    const stub = env.VAULT_DO.getByName(vaultId);
+    await expect(
+      stub.submitChange(
+        change({ operationId: "op-empty", path: "empty.md", operation: "create", payload: undefined }),
+        "dev-test-0001",
+      ),
+    ).rejects.toThrow(/file content required/);
+    await expect(
+      stub.submitChange(
+        change({ operationId: "op-empty-upd", path: "empty.md", operation: "update", payload: undefined }),
+        "dev-test-0001",
+      ),
+    ).rejects.toThrow(/file content required/);
   });
 
   it("rejects changes forged under another device id and bad paths", async () => {

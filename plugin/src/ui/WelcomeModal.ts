@@ -1,5 +1,7 @@
 import { App, Modal, Notice, Setting } from "obsidian";
 import { AuthManager } from "../auth/AuthManager";
+import { ApiError } from "../api/SyncClient";
+import { friendlyApiMessage } from "./friendlyErrors";
 
 export class WelcomeModal extends Modal {
   constructor(
@@ -90,7 +92,7 @@ class NewUserModal extends Modal {
           this.close();
           this.onDone();
         } catch (e) {
-          new Notice(`SyncVault: ${(e as Error).message}`, 6000);
+          new Notice(`SyncVault: ${friendlyApiMessage(e instanceof ApiError ? e.code : undefined, (e as Error).message)}`, 6000);
           b.setDisabled(false);
         }
       }),
@@ -135,7 +137,7 @@ class ExistingUserModal extends Modal {
         try {
           this.vaults = await this.auth.fetchVaults(this.accountId, this.password);
         } catch (e) {
-          new Notice(`SyncVault: ${(e as Error).message}`, 6000);
+          new Notice(`SyncVault: ${friendlyApiMessage(e instanceof ApiError ? e.code : undefined, (e as Error).message)}`, 6000);
           b.setDisabled(false);
           return;
         }
@@ -174,7 +176,7 @@ class ExistingUserModal extends Modal {
           this.close();
           this.onDone();
         } catch (e) {
-          new Notice(`SyncVault: ${(e as Error).message}`, 6000);
+          new Notice(`SyncVault: ${friendlyApiMessage(e instanceof ApiError ? e.code : undefined, (e as Error).message)}`, 6000);
           b.setDisabled(false);
         }
       }),

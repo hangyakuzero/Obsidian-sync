@@ -150,4 +150,67 @@ describe("HTTP sync endpoints", () => {
     const log = await vault.changesAfter(0);
     expect(log.map((c) => c.operation)).toEqual(["create", "create"]);
   });
+
+  it("rejects payload-less creates and supports authenticated vault reset", async () => {
+    const t = await setup("httpt5");
+    const vault = env.VAULT_DO.getByName(t.vaultId);
+
+    // payload-less create -> 400 PAYLOAD_REQUIRED, nothing committed
+    const empty = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/changes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth(t) },
+      body: JSON.stringify(change({ deviceId: t.deviceId, payload: undefined })),
+    });
+    expect(empty.status).toBe(400);
+    expect((await empty.json()).error).toBe("PAYLOAD_REQUIRED");
+    expect((await vault.status()).currentRevision).toBe(0);
+
+    // a real create is committed
+    const push = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/changes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth(t) },
+      body: JSON.stringify(change({ deviceId: t.deviceId })),
+    });
+    expect(push.status).toBe(200);
+    expect((await vault.status()).currentRevision).toBe(1);
+
+    // reset guards: missing password fields -> 400, wrong password -> 401,
+    // mismatched confirmation -> 400
+    const noPassword = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/reset`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth(t) },
+      body: JSON.stringify({ accountId: t.accountId, confirm: "V" }),
+    });
+    expect(noPassword.status).toBe(400);
+
+    const wrongPassword = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/reset`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth(t) },
+      body: JSON.stringify({ accountId: t.accountId, password: "wrong", confirm: "V" }),
+    });
+    expect(wrongPassword.status).toBe(401);
+
+    const badConfirm = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/reset`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth(t) },
+      body: JSON.stringify({ accountId: t.accountId, password: PASSWORD, confirm: "nope" }),
+    });
+    expect(badConfirm.status).toBe(400);
+
+    // correct reset wipes history but keeps the device token valid
+    const reset = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/reset`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth(t) },
+      body: JSON.stringify({ accountId: t.accountId, password: PASSWORD, confirm: "V" }),
+    });
+    expect(reset.status).toBe(200);
+    expect((await vault.status()).currentRevision).toBe(0);
+    expect(await vault.changesAfter(0)).toHaveLength(0);
+
+    const pull = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/sync?since=0`, {
+      headers: { Authorization: auth(t) },
+    });
+    expect(pull.status).toBe(200);
+    expect(((await pull.json()) as { changes: Change[] }).changes).toHaveLength(0);
+  });
 });

@@ -122,6 +122,14 @@ async function route(request: Request, env: Env): Promise<Response> {
           throw new ApiError("UNAUTHORIZED", "invalid token");
         }
         const change = await request.json<Change>();
+        // Validate here (not only inside the DO) so the error code survives the
+        // DO RPC boundary and maps to a clean 4xx response.
+        if (
+          (change.operation === "create" || change.operation === "update") &&
+          typeof change.payload !== "string"
+        ) {
+          throw new ApiError("PAYLOAD_REQUIRED", "file content required");
+        }
         const result = await env.VAULT_DO.getByName(rest[0]).submitChange(change, auth.deviceId);
         if (result.status === "accepted") {
           return Response.json({ status: "accepted", revision: result.revision });
@@ -143,6 +151,28 @@ async function route(request: Request, env: Env): Promise<Response> {
           throw new ApiError("BAD_REQUEST", "revision required");
         }
         await env.VAULT_DO.getByName(rest[0]).ack(auth.deviceId, body.revision);
+        return Response.json({ ok: true });
+      }
+      if (rest.length === 2 && rest[1] === "reset" && request.method === "POST") {
+        const auth = bearer(request);
+        if (!auth || !(await authDevice(env, auth, rest[0]))) {
+          throw new ApiError("UNAUTHORIZED", "invalid token");
+        }
+        const body = await request.json<{ accountId?: string; password?: string; confirm?: string }>();
+        if (!body.accountId || typeof body.password !== "string" || typeof body.confirm !== "string") {
+          throw new ApiError("BAD_REQUEST", "accountId, password and confirm required");
+        }
+        if (body.accountId !== auth.accountId) {
+          throw new ApiError("UNAUTHORIZED", "invalid token");
+        }
+        const login = await env.ACCOUNT_DO.getByName(body.accountId).verifyLogin(body.accountId, body.password);
+        if (!login.ok) throw new ApiError(login.code, login.message);
+        const vault = await env.ACCOUNT_DO.getByName(body.accountId).getVault(body.accountId, rest[0]);
+        if (!vault.ok) throw new ApiError(vault.code, vault.message);
+        if (body.confirm !== rest[0] && body.confirm !== vault.value.name) {
+          throw new ApiError("BAD_REQUEST", "confirmation does not match the vault");
+        }
+        await env.VAULT_DO.getByName(rest[0]).resetVault();
         return Response.json({ ok: true });
       }
       if (request.method === "POST" && rest.length === 2 && rest[1] === "devices") {

@@ -151,6 +151,27 @@ export class SyncClient {
     >;
   }
 
+  /**
+   * Repair operation: wipe the server's sync history for this vault so this
+   * device can reseed it as a fresh baseline. Requires the account password
+   * and a confirmation string (vault name or id) to prevent accidents.
+   */
+  async resetVault(
+    accountId: string,
+    vaultId: string,
+    deviceId: string,
+    token: string,
+    password: string,
+    confirm: string,
+  ): Promise<void> {
+    const auth = `Bearer ${accountId}:${deviceId}:${token}`;
+    await this.request<{ ok: boolean }>(`/v1/vaults/${vaultId}/reset`, {
+      method: "POST",
+      headers: { Authorization: auth },
+      body: { accountId, password, confirm },
+    });
+  }
+
   async sendAck(
     accountId: string,
     vaultId: string,

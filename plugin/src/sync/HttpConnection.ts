@@ -1,7 +1,16 @@
 import type { Change } from "@syncvault/shared";
-import type { SyncClient } from "../api/SyncClient";
+import type { ApiError, SyncClient } from "../api/SyncClient";
 import type { Connection, ConnectionCallbacks } from "./SyncConnection";
 import { SyncState } from "../state/SyncState";
+
+function isApiError(e: unknown): e is ApiError {
+  const maybe = e as ApiError;
+  return (
+    maybe instanceof Error &&
+    typeof maybe.status === "number" &&
+    typeof maybe.code === "string"
+  );
+}
 
 const HTTP_ACK_TIMEOUT_MS = 30_000;
 
@@ -82,8 +91,14 @@ export class HttpConnection implements Connection {
         });
       }
     } catch (e) {
-      this.callbacks.onError(`push failed: ${(e as Error).message}`);
       clearTimeout(timeout);
+      if (isApiError(e) && e.status >= 400 && e.status < 500 && e.code !== "UNAUTHORIZED") {
+        // Permanent rejection (payload required, bad path, too large):
+        // drop the change and keep sync moving instead of retrying forever.
+        this.callbacks.onRejected?.(change.operationId, e.code, e.message);
+        return;
+      }
+      this.callbacks.onError(`push failed: ${(e as Error).message}`);
     }
   }
 

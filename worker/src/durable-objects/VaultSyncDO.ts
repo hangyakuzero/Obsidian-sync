@@ -103,6 +103,14 @@ export class VaultSyncDO extends DurableObject<Env> {
     if (!change.operationId || change.operationId.length > 100) {
       throw new ApiError("BAD_REQUEST", "missing operationId");
     }
+    if (change.operation === "create" || change.operation === "update") {
+      if (typeof change.payload !== "string") {
+        throw new ApiError("PAYLOAD_REQUIRED", "file content required");
+      }
+      if (change.payload.length > MAX_PAYLOAD_BASE64) {
+        throw new ApiError("PAYLOAD_TOO_LARGE", "file exceeds size limit");
+      }
+    }
     const path = normalizePath(change.path);
     const receipt = this.getReceipt(change.operationId);
     if (receipt !== null) {
@@ -153,6 +161,22 @@ export class VaultSyncDO extends DurableObject<Env> {
 
   async runGarbageCollection(): Promise<void> {
     this.garbageCollect();
+  }
+
+  /**
+   * Repair operation: wipe server-side sync history for this vault so a device
+   * can reseed it as a fresh baseline. Local vault files are never touched.
+   */
+  async resetVault(): Promise<void> {
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM changes");
+      this.ctx.storage.sql.exec("DELETE FROM path_state");
+      this.ctx.storage.sql.exec("DELETE FROM operation_receipts");
+      this.ctx.storage.sql.exec("DELETE FROM devices");
+      this.ctx.storage.sql.exec(
+        "UPDATE vault_state SET current_revision = 0, min_retained_revision = 1 WHERE id = 1",
+      );
+    });
   }
 
   private garbageCollect(): void {
@@ -311,9 +335,6 @@ export class VaultSyncDO extends DurableObject<Env> {
     switch (change.operation) {
       case "create":
       case "update": {
-        if (change.payload !== undefined && change.payload.length > MAX_PAYLOAD_BASE64) {
-          throw new ApiError("PAYLOAD_TOO_LARGE", "file exceeds size limit");
-        }
         if (pathRev !== null && pathRev > change.baseRevision) {
           return { serverRevision: pathRev, conflictPath: this.freshConflictPath(path, change) };
         }

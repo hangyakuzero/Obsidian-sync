@@ -3,6 +3,7 @@ import type SyncVaultPlugin from "../main";
 import { SyncState } from "../state/SyncState";
 import { AuthManager } from "../auth/AuthManager";
 import { WelcomeModal } from "./WelcomeModal";
+import { RebuildModal } from "./RebuildModal";
 import { SyncClient } from "../api/SyncClient";
 import type { SyncEngine, SyncStatus } from "../sync/SyncEngine";
 
@@ -14,6 +15,7 @@ const STATUS_LABELS: Record<SyncStatus, string> = {
   conflict: "⚠ Conflict",
   offline: "✕ Offline",
   synced: "✓ Synced",
+  paused: "⏸ Paused",
 };
 
 export class SyncVaultSettingsTab extends PluginSettingTab {
@@ -63,6 +65,43 @@ export class SyncVaultSettingsTab extends PluginSettingTab {
         void this.engine.syncNow().then(() => this.display());
       }),
     );
+
+    if (this.engine.isPaused) {
+      new Setting(containerEl)
+        .setName("Sync paused")
+        .setDesc("A remote change could not be applied, so polling stopped.")
+        .addButton((b) =>
+          b.setButtonText("Resume sync").setCta().onClick(() => {
+            void this.engine.resume().then(() => this.display());
+          }),
+        );
+    }
+
+    new Setting(containerEl)
+      .setName("Rescue")
+      .setDesc("Recover a vault whose server history is corrupted (e.g. old builds uploaded files without content).")
+      .addButton((b) =>
+        b
+          .setButtonText("Rebuild vault from this device")
+          .setWarning()
+          .onClick(() => {
+            new RebuildModal(this.app, this.state, this.client, "rebuild", () => {
+              void this.engine.resume();
+              this.display();
+            }).open();
+          }),
+      )
+      .addButton((b) =>
+        b
+          .setButtonText("Join rebuilt vault")
+          .setWarning()
+          .onClick(() => {
+            new RebuildModal(this.app, this.state, this.client, "join", () => {
+              void this.engine.resume();
+              this.display();
+            }).open();
+          }),
+      );
 
     new Setting(containerEl).addButton((b) =>
       b.setButtonText("Disconnect vault").onClick(async () => {

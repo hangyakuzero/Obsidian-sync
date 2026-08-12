@@ -60,12 +60,17 @@ export class AccountDO extends DurableObject<Env> {
       .exec<{ account_id: string }>("SELECT account_id FROM accounts WHERE account_id = ?", accountId)
       .toArray()[0];
     if (existing) return fail("CONFLICT", "account already exists");
-    this.ctx.storage.sql.exec(
-      "INSERT INTO accounts (account_id, password_hash, created_at) VALUES (?, ?, ?)",
-      accountId,
-      passwordHash,
-      Date.now(),
-    );
+    try {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO accounts (account_id, password_hash, created_at) VALUES (?, ?, ?)",
+        accountId,
+        passwordHash,
+        Date.now(),
+      );
+    } catch {
+      // concurrent create won the race; uniqueness is enforced by the PK
+      return fail("CONFLICT", "account already exists");
+    }
     return ok({ accountId });
   }
 
@@ -116,6 +121,18 @@ export class AccountDO extends DurableObject<Env> {
     const login = await this.verifyLogin(accountId, password);
     if (!login.ok) return login;
     return ok(this.vaultRowsFor(accountId));
+  }
+
+  async getVault(accountId: string, vaultId: string): Promise<Result<VaultInfo>> {
+    const row = this.ctx.storage.sql
+      .exec<{ vault_id: string; name: string }>(
+        "SELECT vault_id, name FROM vaults WHERE vault_id = ? AND account_id = ?",
+        vaultId,
+        accountId,
+      )
+      .toArray()[0];
+    if (!row) return fail("NOT_FOUND", "vault not found");
+    return ok({ vaultId: row.vault_id, name: row.name });
   }
 
   private vaultRowsFor(accountId: string): VaultInfo[] {

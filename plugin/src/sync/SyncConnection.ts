@@ -27,6 +27,7 @@ export interface ConnectionCallbacks {
   onRemoteChange(change: Change): void;
   onAccepted(operationId: string, revision: number): void;
   onConflict(opts: { operationId: string; path: string; conflictPath?: string; serverRevision: number }): void;
+  onRejected?(operationId: string, code: string, message: string): void;
   onError(message: string): void;
   onStatusChange(status: ConnectionStatus): void;
 }
