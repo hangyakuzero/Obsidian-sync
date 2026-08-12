@@ -1,0 +1,19 @@
+{
+  "name": "obsidian-sync",
+  "private": true,
+  "version": "0.1.0",
+  "description": "SyncVault monorepo: Obsidian plugin + Cloudflare Worker",
+  "workspaces": [
+    "shared",
+    "plugin",
+    "worker"
+  ],
+  "scripts": {
+    "dev:plugin": "npm run dev --workspace plugin",
+    "dev:worker": "npm run dev --workspace worker",
+    "build:plugin": "npm run build --workspace plugin",
+    "build:worker": "npm run build --workspace worker",
+    "release": "node scripts/release.mjs",
+    "test": "npm run test --workspaces --if-present"
+  }
+}

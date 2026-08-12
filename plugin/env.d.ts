@@ -1,0 +1,1 @@
+declare const __SYNCVAULT_SERVER_URL__: string;

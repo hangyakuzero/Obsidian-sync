@@ -1,0 +1,19 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "syncvault",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-06",
+  "durable_objects": {
+    "bindings": [
+      { "name": "ACCOUNT_DO", "class_name": "AccountDO" },
+      { "name": "VAULT_DO", "class_name": "VaultSyncDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AccountDO", "VaultSyncDO"] }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}
