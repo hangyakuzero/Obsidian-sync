@@ -55,14 +55,14 @@ export class SyncEngine {
     this.connection =
       connectionFactory?.(handlers) ??
       new SyncConnection(
-        {
-          serverUrl: state.serverUrl,
-          accountId: state.accountId ?? "",
-          vaultId: state.vaultId ?? "",
-          deviceId: state.deviceId ?? "",
-          token: state.deviceToken ?? "",
+        () => ({
+          serverUrl: this.state.serverUrl,
+          accountId: this.state.accountId ?? "",
+          vaultId: this.state.vaultId ?? "",
+          deviceId: this.state.deviceId ?? "",
+          token: this.state.deviceToken ?? "",
           getLastRevision: () => this.state.lastRevision,
-        },
+        }),
         handlers,
       );
   }
@@ -184,7 +184,10 @@ export class SyncEngine {
         resolve(null);
       }, ACK_TIMEOUT_MS);
       this.pendingAcks.set(item.operationId, { resolve, timer });
-      if (!this.connection.sendChange(item)) {
+      // The watcher stamps changes without a deviceId; the authenticated
+      // device is known only at send time.
+      const wireChange: Change = { ...item, deviceId: this.state.deviceId ?? "" };
+      if (!this.connection.sendChange(wireChange)) {
         clearTimeout(timer);
         this.pendingAcks.delete(item.operationId);
         resolve(null);

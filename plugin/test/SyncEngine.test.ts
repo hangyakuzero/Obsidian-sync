@@ -171,6 +171,20 @@ describe("SyncEngine", () => {
     expect(rig.state.lastRevision).toBe(4);
   });
 
+  it("stamps the authenticated deviceId on queued changes at send time", async () => {
+    const rig = makeRig();
+    // Simulate a change captured before identity was configured (deviceId "").
+    await rig.queue.enqueue(
+      change({ operationId: "op-0", deviceId: "", path: "x.md", operation: "create" }),
+    );
+    const synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.conn.sent.length).toBe(1);
+    expect(rig.conn.sent[0].deviceId).toBe("dev-0001");
+    rig.conn.handlers.onAccepted("op-0", 4);
+    await synced;
+  });
+
   it("applies a remote delete without echo", async () => {
     const rig = makeRig();
     const remote: Change = change({ operationId: "remote-del", revision: 5, path: "bye.md", operation: "delete" });

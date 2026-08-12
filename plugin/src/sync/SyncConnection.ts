@@ -31,7 +31,7 @@ export class SyncConnection {
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
-    private params: ConnectionParams,
+    private params: () => ConnectionParams,
     private callbacks: ConnectionCallbacks,
   ) {}
 
@@ -50,7 +50,8 @@ export class SyncConnection {
       ws.onopen = () => {
         if (typeof ws !== "undefined" && ws !== this.ws) return;
         this.retryIndex = 0;
-        this.send({ type: "hello", accountId: this.params.accountId, vaultId: this.params.vaultId, deviceId: this.params.deviceId, token: this.params.token, lastRevision: this.params.getLastRevision() });
+        const p = this.params();
+        this.send({ type: "hello", accountId: p.accountId, vaultId: p.vaultId, deviceId: p.deviceId, token: p.token, lastRevision: p.getLastRevision() });
       };
       ws.onmessage = (event) => this.dispatch(event);
       ws.onclose = (event) => this.handleClose(event);
@@ -87,9 +88,10 @@ export class SyncConnection {
   }
 
   private wsUrl(): string {
-    const wsBase = this.params.serverUrl.replace(/^http/, "ws").replace(/\/+$/, "");
-    const params = new URLSearchParams({ accountId: this.params.accountId, deviceId: this.params.deviceId });
-    return `${wsBase}/v1/vaults/${this.params.vaultId}/ws?${params.toString()}`;
+    const p = this.params();
+    const wsBase = p.serverUrl.replace(/^http/, "ws").replace(/\/+$/, "");
+    const q = new URLSearchParams({ accountId: p.accountId, deviceId: p.deviceId });
+    return `${wsBase}/v1/vaults/${p.vaultId}/ws?${q.toString()}`;
   }
 
   private send(msg: ClientMessage): boolean {
