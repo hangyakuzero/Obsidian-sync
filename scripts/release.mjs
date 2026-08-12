@@ -18,7 +18,7 @@ for (const file of ["manifest.json", "main.js"]) {
 if (existsSync(resolve(pluginDir, "styles.css"))) {
   copyFileSync(resolve(pluginDir, "styles.css"), resolve(target, "styles.css"));
 } else {
-  writeFileSync(resolve(target, "styles.css"), "");
+  writeFileSync(resolve(target, "styles.css"), "/* SyncVault: no custom styles yet */\n");
 }
 
 // Root manifest mirror: BRAT identifies plugins via <repo>/manifest.json.
