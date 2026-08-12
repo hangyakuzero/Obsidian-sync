@@ -2,6 +2,17 @@ import { Change, ClientMessage, ServerMessage } from "@syncvault/shared";
 
 export type ConnectionStatus = "idle" | "connecting" | "open" | "offline";
 
+export interface Connection {
+  connected: boolean;
+  connect(): void;
+  disconnect(): void;
+  sendChange(change: Change): boolean;
+  sendAck(revision: number): boolean;
+  pull(
+    since: number,
+  ): Promise<{ currentRevision: number; changes: Change[]; resyncRequired: boolean }>;
+}
+
 export interface ConnectionParams {
   serverUrl: string;
   accountId: string;
@@ -23,7 +34,7 @@ export interface ConnectionCallbacks {
 const RETRY_BACKOFFS = [2000, 5000, 10_000, 30_000];
 const FATAL_CLOSE_REASONS = new Set([4001, 4400, 4401, 4402]);
 
-export class SyncConnection {
+export class SyncConnection implements Connection {
   private ws: WebSocket | null = null;
   private status: ConnectionStatus = "idle";
   private manualClose = false;
@@ -34,6 +45,11 @@ export class SyncConnection {
     private params: () => ConnectionParams,
     private callbacks: ConnectionCallbacks,
   ) {}
+
+  // Realtime transport: changes arrive live via the socket; nothing to poll.
+  async pull(): Promise<{ currentRevision: number; changes: Change[]; resyncRequired: boolean }> {
+    return { currentRevision: 0, changes: [], resyncRequired: false };
+  }
 
   get connected(): boolean {
     return this.status === "open";

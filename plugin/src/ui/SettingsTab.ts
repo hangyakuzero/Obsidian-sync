@@ -4,7 +4,17 @@ import { SyncState } from "../state/SyncState";
 import { AuthManager } from "../auth/AuthManager";
 import { WelcomeModal } from "./WelcomeModal";
 import { SyncClient } from "../api/SyncClient";
-import type { SyncEngine } from "../sync/SyncEngine";
+import type { SyncEngine, SyncStatus } from "../sync/SyncEngine";
+
+const STATUS_LABELS: Record<SyncStatus, string> = {
+  idle: "idle",
+  syncing: "↻ Syncing",
+  downloading: "↓ Downloading",
+  uploading: "↑ Uploading",
+  conflict: "⚠ Conflict",
+  offline: "✕ Offline",
+  synced: "✓ Synced",
+};
 
 export class SyncVaultSettingsTab extends PluginSettingTab {
   constructor(
@@ -42,11 +52,15 @@ export class SyncVaultSettingsTab extends PluginSettingTab {
     new Setting(containerEl).setName("Account").setDesc(this.state.accountId ?? "");
     new Setting(containerEl).setName("Vault").setDesc(this.state.vaultName ?? this.state.vaultId ?? "");
     new Setting(containerEl).setName("Device").setDesc(this.state.deviceName ?? this.state.deviceId ?? "");
-    new Setting(containerEl).setName("Status").setDesc("✓ Synced (setup complete)");
+    new Setting(containerEl)
+      .setName("Status")
+      .setDesc(
+        `${STATUS_LABELS[this.engine.status]} · revision ${this.state.lastRevision} · ${this.engine.pendingCount} pending`,
+      );
 
     new Setting(containerEl).addButton((b) =>
       b.setButtonText("Sync now").setCta().onClick(() => {
-        void this.engine.syncNow();
+        void this.engine.syncNow().then(() => this.display());
       }),
     );
 

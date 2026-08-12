@@ -14,6 +14,8 @@ export interface SyncVaultData {
   deviceToken?: string;
   lastRevision: number;
   pendingChanges: QueuedChange[];
+  seeded: boolean;
+  appliedPaths: string[];
 }
 
 export interface SyncStateBackend {
@@ -25,6 +27,8 @@ export const DEFAULT_SYNC_DATA: SyncVaultData = {
   serverUrl: __SYNCVAULT_SERVER_URL__,
   lastRevision: 0,
   pendingChanges: [],
+  seeded: false,
+  appliedPaths: [],
 };
 
 export class SyncState {
@@ -81,6 +85,39 @@ export class SyncState {
     if (saved) {
       this.data = { ...DEFAULT_SYNC_DATA, pendingChanges: [], ...saved };
       if (!Array.isArray(this.data.pendingChanges)) this.data.pendingChanges = [];
+      if (!Array.isArray(this.data.appliedPaths)) this.data.appliedPaths = [];
+    }
+  }
+
+  get seeded(): boolean {
+    return this.data.seeded;
+  }
+
+  async markSeeded(): Promise<void> {
+    if (!this.data.seeded) {
+      await this.save({ seeded: true });
+    }
+  }
+
+  hasApplied(path: string): boolean {
+    return this.data.appliedPaths.includes(path);
+  }
+
+  async markApplied(newPath?: string, oldPath?: string): Promise<void> {
+    const changed: string[] = [];
+    if (newPath && !this.data.appliedPaths.includes(newPath)) {
+      this.data.appliedPaths.push(newPath);
+      changed.push(newPath);
+    }
+    if (oldPath) {
+      const idx = this.data.appliedPaths.indexOf(oldPath);
+      if (idx >= 0) {
+        this.data.appliedPaths.splice(idx, 1);
+        changed.push(oldPath);
+      }
+    }
+    if (changed.length > 0) {
+      await this.save({});
     }
   }
 
@@ -108,6 +145,8 @@ export class SyncState {
       deviceName: undefined,
       deviceToken: undefined,
       lastRevision: 0,
+      seeded: false,
+      appliedPaths: [],
     });
   }
 }

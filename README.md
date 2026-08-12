@@ -9,7 +9,7 @@ Each device keeps its own vault; no R2, no Postgres, no permanent cloud storage.
 
 - **Plugin** — TypeScript Obsidian plugin (`plugin/`), `isDesktopOnly: false`, uses only Obsidian's cross-platform Vault API and `requestUrl`.
 - **Worker** — Cloudflare Worker (`worker/`): stateless router, `AccountDO` (accounts, vault registry, device tokens), `VaultSyncDO` (one per vault, SQLite-backed: revision log, path state, device ACKs, garbage collection).
-- **Realtime** — WebSockets via the Durable Object Hibernation API; catch-up by revision cursor on (re)connect; no polling needed.
+- **Transport** — HTTP polling by default (poll, push, ack endpoints): `requestUrl` is dependable on desktop + mobile. A WebSocket transport (Hibernation API) exists in the codebase for future realtime use.
 - **Shared protocol types** — `shared/`.
 
 ## How sync works
@@ -18,6 +18,7 @@ Each device keeps its own vault; no R2, no Postgres, no permanent cloud storage.
 2. Device edits are captured by the watcher (debounced, coalesced) into a **persistent local queue** that survives restarts and offline periods.
 3. On connect: `hello` with the device token + last-known revision → server replays missing changes (batched) → device applies them with **path-based event suppression** (applied changes never echo back as new uploads) → ACKs.
 4. Device flushes its queue; each change carries its `baseRevision` — stale writes are rejected and preserved as server-side conflict copies `File (conflict-<device>-<ts>).md`. No silent overwrites.
+5. On first connection each device **seeds** its local files (skipping paths already pulled from the server), so an existing vault reaches the server and new devices download it.
 5. Changes are purged once every active device ACKed them or after 7 days; clients older than the retained history get `resync_required` (not implemented in V1).
 
 ## Development

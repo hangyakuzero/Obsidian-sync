@@ -137,7 +137,11 @@ export class VaultSyncDO extends DurableObject<Env> {
 
   async changesAfter(lastRevision: number): Promise<Change[]> {
     return this.ctx.storage.sql
-      .exec<ChangeRow>("SELECT * FROM changes WHERE revision > ? ORDER BY revision", lastRevision)
+      .exec<ChangeRow>(
+        "SELECT * FROM changes WHERE revision > ? ORDER BY revision LIMIT ?",
+        lastRevision,
+        CHANGE_BATCH,
+      )
       .toArray()
       .map((r) => this.rowToChange(r));
   }

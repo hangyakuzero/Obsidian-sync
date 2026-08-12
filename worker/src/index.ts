@@ -1,5 +1,6 @@
 import { ApiError, STATUS_FOR_CODE } from "./errors";
 import type { Env } from "./env";
+import type { Change } from "@syncvault/shared";
 import { AccountDO } from "./durable-objects/AccountDO";
 import { VaultSyncDO } from "./durable-objects/VaultSyncDO";
 
@@ -97,6 +98,53 @@ async function route(request: Request, env: Env): Promise<Response> {
         if (!result.ok) throw new ApiError(result.code, result.message);
         return Response.json({ vaults: result.value });
       }
+      if (rest.length === 2 && rest[1] === "sync" && request.method === "GET") {
+        const auth = bearer(request);
+        if (!auth || !(await authDevice(env, auth, rest[0]))) {
+          throw new ApiError("UNAUTHORIZED", "invalid token");
+        }
+        const since = Math.max(0, parseInt(url.searchParams.get("since") ?? "0", 10) || 0);
+        const stub = env.VAULT_DO.getByName(rest[0]);
+        const [statusRes, changes] = await Promise.all([
+          stub.status(),
+          stub.changesAfter(since),
+        ]);
+        return Response.json({
+          currentRevision: statusRes.currentRevision,
+          minRetainedRevision: statusRes.minRetainedRevision,
+          resyncRequired: since < statusRes.minRetainedRevision - 1,
+          changes,
+        });
+      }
+      if (rest.length === 2 && rest[1] === "changes" && request.method === "POST") {
+        const auth = bearer(request);
+        if (!auth || !(await authDevice(env, auth, rest[0]))) {
+          throw new ApiError("UNAUTHORIZED", "invalid token");
+        }
+        const change = await request.json<Change>();
+        const result = await env.VAULT_DO.getByName(rest[0]).submitChange(change, auth.deviceId);
+        if (result.status === "accepted") {
+          return Response.json({ status: "accepted", revision: result.revision });
+        }
+        return Response.json({
+          status: "conflict",
+          path: result.path,
+          conflictPath: result.conflictPath,
+          serverRevision: result.serverRevision,
+        });
+      }
+      if (rest.length === 2 && rest[1] === "ack" && request.method === "POST") {
+        const auth = bearer(request);
+        if (!auth || !(await authDevice(env, auth, rest[0]))) {
+          throw new ApiError("UNAUTHORIZED", "invalid token");
+        }
+        const body = await request.json<{ revision?: number }>();
+        if (typeof body.revision !== "number") {
+          throw new ApiError("BAD_REQUEST", "revision required");
+        }
+        await env.VAULT_DO.getByName(rest[0]).ack(auth.deviceId, body.revision);
+        return Response.json({ ok: true });
+      }
       if (request.method === "POST" && rest.length === 2 && rest[1] === "devices") {
         const vaultId = rest[0];
         const body = await request.json<{ accountId?: string; password?: string; deviceId?: string; name?: string }>();
@@ -131,6 +179,12 @@ async function proxySocket(env: Env, vaultId: string, url: URL, request: Request
     return new Response("expected websocket upgrade", { status: 426 });
   }
   return env.VAULT_DO.getByName(vaultId).fetch(request);
+}
+
+async function authDevice(env: Env, auth: Auth, vaultId: string): Promise<boolean> {
+  return env.ACCOUNT_DO
+    .getByName(auth.accountId)
+    .verifyDevice(auth.accountId, auth.deviceId, auth.token, vaultId);
 }
 
 interface Auth {

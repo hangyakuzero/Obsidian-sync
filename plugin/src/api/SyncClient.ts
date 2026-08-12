@@ -1,4 +1,5 @@
 import { requestUrl } from "obsidian";
+import type { Change } from "@syncvault/shared";
 
 export class ApiError extends Error {
   constructor(
@@ -103,5 +104,65 @@ export class SyncClient {
       throw new ApiError(response.status, code, message);
     }
     return response.json as T;
+  }
+
+  async pullChanges(
+    accountId: string,
+    vaultId: string,
+    deviceId: string,
+    token: string,
+    since: number,
+  ): Promise<{
+    currentRevision: number;
+    minRetainedRevision: number;
+    resyncRequired: boolean;
+    changes: Change[];
+  }> {
+    const auth = `Bearer ${accountId}:${deviceId}:${token}`;
+    const res = await this.request<{
+      currentRevision: number;
+      minRetainedRevision: number;
+      resyncRequired: boolean;
+      changes: Change[];
+    }>(`/v1/vaults/${vaultId}/sync?since=${since}`, { headers: { Authorization: auth } });
+    return res;
+  }
+
+  async pushChange(
+    accountId: string,
+    vaultId: string,
+    deviceId: string,
+    token: string,
+    change: Change,
+  ): Promise<{ status: "accepted"; revision: number } | { status: "conflict"; path: string; conflictPath?: string; serverRevision: number }> {
+    const auth = `Bearer ${accountId}:${deviceId}:${token}`;
+    return this.request<{
+      status: "accepted" | "conflict";
+      revision?: number;
+      path?: string;
+      conflictPath?: string;
+      serverRevision?: number;
+    }>(`/v1/vaults/${vaultId}/changes`, {
+      method: "POST",
+      headers: { Authorization: auth },
+      body: { ...change, deviceId },
+    }) as Promise<
+      { status: "accepted"; revision: number } | { status: "conflict"; path: string; conflictPath?: string; serverRevision: number }
+    >;
+  }
+
+  async sendAck(
+    accountId: string,
+    vaultId: string,
+    deviceId: string,
+    token: string,
+    revision: number,
+  ): Promise<void> {
+    const auth = `Bearer ${accountId}:${deviceId}:${token}`;
+    await this.request<{ ok: boolean }>(`/v1/vaults/${vaultId}/ack`, {
+      method: "POST",
+      headers: { Authorization: auth },
+      body: { revision },
+    });
   }
 }

@@ -33,6 +33,10 @@ class FakeConnection implements Connection {
     this.acks.push(revision);
     return true;
   }
+
+  async pull(): Promise<{ currentRevision: number; changes: Change[]; resyncRequired: boolean }> {
+    return { currentRevision: 0, changes: [], resyncRequired: false };
+  }
 }
 
 function makeConfiguredState(): SyncState {
@@ -89,9 +93,11 @@ function makeRig(): Rig {
     onChange: (change) => queue.enqueue(change),
   });
   let conn: FakeConnection | null = null;
-  const engine = new SyncEngine(state, queue, watcher, vault, () => undefined, () => undefined, (handlers) => {
-    conn = new FakeConnection(handlers);
-    return conn;
+  const engine = new SyncEngine(state, queue, watcher, vault, () => undefined, () => undefined, {
+    connectionFactory: (handlers) => {
+      conn = new FakeConnection(handlers);
+      return conn;
+    },
   });
   return { state, queue, watcher, conn: conn!, engine, writes, removes, renames };
 }
@@ -204,6 +210,50 @@ describe("SyncEngine", () => {
     expect(rig.queue.size()).toBe(0);
     expect(rig.conn.acks).toEqual([6]);
     expect(rig.state.lastRevision).toBe(6);
+  });
+
+  it("polls pulled changes, applies them, ACKs and advances the cursor", async () => {
+    const rig = makeRig();
+    const pulled: Change = change({
+      operationId: "remote-1",
+      revision: 7,
+      path: "pulled.md",
+      operation: "create",
+      payload: toBase64(new TextEncoder().encode("hello")),
+    });
+    (rig.conn as unknown as FakeConnection & { pullOverride?: unknown }).pull = async () => ({
+      currentRevision: 7,
+      resyncRequired: false,
+      changes: [pulled],
+    });
+    await rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.writes.length).toBe(1);
+    expect(rig.writes[0].path).toBe("pulled.md");
+    expect(rig.state.lastRevision).toBe(7);
+    expect(rig.conn.acks).toEqual([7]);
+    expect(rig.queue.size()).toBe(0);
+  });
+
+  it("seeds local files once, skipping applied, .obsidian and oversized paths", async () => {
+    const rig = makeRig();
+    rig.engine["scanner"] = {
+      listFiles: async () => [
+        { path: "local-only.md", size: 100 },
+        { path: "already-on-server.md", size: 200 },
+        { path: ".obsidian/workspace", size: 50 },
+        { path: "big.bin", size: 5 * 1024 * 1024 },
+      ],
+    };
+    await rig.state.markApplied("already-on-server.md");
+    await rig.engine["maybeSeed"]();
+    expect(rig.queue.size()).toBe(1);
+    expect(rig.queue.items[0].path).toBe("local-only.md");
+    expect(rig.queue.items[0].operation).toBe("create");
+    expect(rig.state.seeded).toBe(true);
+    // second call is a no-op
+    await rig.engine["maybeSeed"]();
+    expect(rig.queue.size()).toBe(1);
   });
 
   it("does not start a second sync while one is in flight", async () => {

@@ -1,8 +1,10 @@
-import { Change, fromBase64, normalizePath } from "@syncvault/shared";
+import { Change, fromBase64, MAX_FILE_BYTES, normalizePath } from "@syncvault/shared";
 import { SyncState, QueuedChange } from "../state/SyncState";
 import { ChangeQueue } from "./ChangeQueue";
 import { VaultWatcher } from "../vault/VaultWatcher";
-import { SyncConnection, ConnectionStatus, ConnectionCallbacks } from "./SyncConnection";
+import { SyncConnection, ConnectionStatus, ConnectionCallbacks, Connection } from "./SyncConnection";
+import { HttpConnection } from "./HttpConnection";
+import { SyncClient } from "../api/SyncClient";
 
 export type SyncStatus = "idle" | "syncing" | "downloading" | "uploading" | "conflict" | "offline" | "synced";
 
@@ -12,12 +14,15 @@ export interface VaultOps {
   rename(oldPath: string, newPath: string): Promise<void>;
 }
 
-export interface Connection {
-  connected: boolean;
-  connect(): void;
-  disconnect(): void;
-  sendChange(change: Change): boolean;
-  sendAck(revision: number): boolean;
+export interface SeedScanner {
+  listFiles(): Promise<{ path: string; size: number }[]>;
+}
+
+export interface EngineOptions {
+  connectionFactory?: (handlers: ConnectionCallbacks) => Connection;
+  client?: SyncClient;
+  scanner?: SeedScanner;
+  pollIntervalMs?: number;
 }
 
 interface PendingAck {
@@ -26,13 +31,18 @@ interface PendingAck {
 }
 
 const ACK_TIMEOUT_MS = 30_000;
+const DEFAULT_POLL_INTERVAL_MS = 4000;
 
 export class SyncEngine {
   private connection: Connection;
-  private status: SyncStatus = "idle";
+  private statusValue: SyncStatus = "idle";
   private syncInFlight = false;
   private pendingAcks = new Map<string, PendingAck>();
   private ackTarget = 0;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private polling = false;
+  private pollIntervalMs: number;
+  private scanner?: SeedScanner;
 
   constructor(
     private state: SyncState,
@@ -41,8 +51,10 @@ export class SyncEngine {
     private vault: VaultOps,
     private onStatus: (status: SyncStatus) => void,
     private onNotice: (message: string, timeout?: number) => void,
-    connectionFactory?: (handlers: ConnectionCallbacks) => Connection,
+    options: EngineOptions = {},
   ) {
+    this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    this.scanner = options.scanner;
     const handlers: ConnectionCallbacks = {
       onWelcome: (serverRevision, resyncRequired) => this.handleWelcome(serverRevision, resyncRequired),
       onRemoteChange: (change) => void this.applyRemoteChange(change),
@@ -53,32 +65,46 @@ export class SyncEngine {
       onStatusChange: (status) => this.handleConnectionStatus(status),
     };
     this.connection =
-      connectionFactory?.(handlers) ??
-      new SyncConnection(
-        () => ({
-          serverUrl: this.state.serverUrl,
-          accountId: this.state.accountId ?? "",
-          vaultId: this.state.vaultId ?? "",
-          deviceId: this.state.deviceId ?? "",
-          token: this.state.deviceToken ?? "",
-          getLastRevision: () => this.state.lastRevision,
-        }),
-        handlers,
-      );
+      options.connectionFactory?.(handlers) ??
+      (options.client
+        ? new HttpConnection(state, options.client, handlers)
+        : new SyncConnection(
+            () => ({
+              serverUrl: this.state.serverUrl,
+              accountId: this.state.accountId ?? "",
+              vaultId: this.state.vaultId ?? "",
+              deviceId: this.state.deviceId ?? "",
+              token: this.state.deviceToken ?? "",
+              getLastRevision: () => this.state.lastRevision,
+            }),
+            handlers,
+          ));
   }
 
-  start(): void {
+  get status(): SyncStatus {
+    return this.statusValue;
+  }
+
+  get pendingCount(): number {
+    return this.queue.size();
+  }
+
+  async start(): Promise<void> {
     if (!this.state.connected) return;
     this.connection.connect();
+    if (this.pollTimer === null) {
+      this.pollTimer = setInterval(() => void this.pollOnce(), this.pollIntervalMs);
+    }
+    await this.pollOnce();
   }
 
   stop(): void {
     this.connection.disconnect();
+    if (this.pollTimer !== null) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
     this.setStatus("idle");
-  }
-
-  get syncing(): boolean {
-    return this.syncInFlight;
   }
 
   async syncNow(): Promise<void> {
@@ -87,13 +113,44 @@ export class SyncEngine {
       return;
     }
     this.connection.connect();
-    await this.flushQueue();
+    await this.pollOnce();
+  }
+
+  private async pollOnce(): Promise<void> {
+    if (!this.state.connected) return;
+    if (this.polling) return;
+    if (!this.connection.connected) return;
+    this.polling = true;
+    try {
+      const result = await this.connection.pull(this.state.lastRevision);
+      if (result.resyncRequired) {
+        this.onNotice(
+          "SyncVault: local history is older than the server retention window. Resync is not supported yet.",
+          10000,
+        );
+        this.setStatus("conflict");
+        return;
+      }
+      if (result.changes.length > 0) this.setStatus("downloading");
+      for (const change of result.changes) {
+        await this.applyRemoteChange(change);
+      }
+      await this.maybeSeed();
+      await this.flushQueue();
+      if (this.state.pendingChanges.length === 0) {
+        this.setStatus(this.connection.connected ? "synced" : "offline");
+      }
+    } catch {
+      this.setStatus(this.connection.connected ? "offline" : "offline");
+    } finally {
+      this.polling = false;
+    }
   }
 
   private handleConnectionStatus(status: ConnectionStatus): void {
     if (status === "offline") {
       this.setStatus("offline");
-    } else if (status === "open" && this.status === "offline") {
+    } else if (status === "open" && this.statusValue === "offline") {
       this.setStatus("synced");
     }
   }
@@ -109,12 +166,15 @@ export class SyncEngine {
   }
 
   private async applyRemoteChange(change: Change): Promise<void> {
-    if (this.status === "idle") this.setStatus("downloading");
+    if (this.statusValue === "idle") this.setStatus("downloading");
     const paths = change.oldPath ? [change.path, change.oldPath] : [change.path];
     // Suppress vault events from these paths so applied changes never loop back into the queue.
     this.watcher.suppress(paths);
     try {
       await this.apply(change);
+      // Remember paths whose content we seeded from the server so the initial
+      // scan never re-uploads them as local-only files.
+      await this.state.markApplied(change.path, change.oldPath);
     } catch (e) {
       this.onNotice(`SyncVault: failed to apply ${change.path}: ${(e as Error).message}`, 8000);
       return;
@@ -128,6 +188,56 @@ export class SyncEngine {
       this.connection.sendAck(change.revision);
     }
     if (this.queue.size() === 0) this.setStatus("synced");
+  }
+
+  /**
+   * First-run seed: enqueue every local file as a "create" so a device's
+   * existing vault reaches the server. Pulled paths (marked applied) are
+   * skipped, preventing duplicates and false conflicts on joined devices.
+   */
+  private async maybeSeed(): Promise<void> {
+    if (this.state.seeded) return;
+    if (!this.scanner) {
+      await this.state.markSeeded();
+      return;
+    }
+    let files: { path: string; size: number }[];
+    try {
+      files = await this.scanner.listFiles();
+    } catch {
+      return; // retried on next poll
+    }
+    for (const f of files) {
+      if (!this.syncablePath(f.path)) continue;
+      if (this.state.hasApplied(f.path)) continue;
+      if (f.size > MAX_FILE_BYTES) continue;
+      await this.queue.enqueue({
+        operationId: this.newOperationId(),
+        revision: 0,
+        deviceId: "",
+        path: f.path,
+        operation: "create",
+        baseRevision: this.state.lastRevision,
+        timestamp: Date.now(),
+      });
+    }
+    await this.state.markSeeded();
+  }
+
+  private syncablePath(path: string): boolean {
+    try {
+      const normalized = normalizePath(path);
+      if (normalized === ".obsidian" || normalized.startsWith(".obsidian/")) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private newOperationId(): string {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
   }
 
   private async apply(change: Change): Promise<void> {
@@ -153,7 +263,7 @@ export class SyncEngine {
     if (!this.connection.connected) return;
     if (this.syncInFlight) return;
     this.syncInFlight = true;
-    this.setStatus(this.queue.size() > 0 ? "uploading" : this.status);
+    this.setStatus(this.queue.size() > 0 ? "uploading" : this.statusValue);
     try {
       for (const item of [...this.queue.items]) {
         if (!this.connection.connected) break;
@@ -207,8 +317,8 @@ export class SyncEngine {
   }
 
   private setStatus(status: SyncStatus): void {
-    if (this.status !== status) {
-      this.status = status;
+    if (this.statusValue !== status) {
+      this.statusValue = status;
       this.onStatus(status);
     }
   }

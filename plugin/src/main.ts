@@ -1,4 +1,4 @@
-import { Notice, Plugin } from "obsidian";
+import { Notice, Plugin, TFile } from "obsidian";
 import { SyncVaultSettingsTab } from "./ui/SettingsTab";
 import { SyncState } from "./state/SyncState";
 import { SyncClient } from "./api/SyncClient";
@@ -53,6 +53,21 @@ export default class SyncVaultPlugin extends Plugin {
     },
     (status) => this.setStatusBar(status),
     (message, timeout) => new Notice(message, timeout ?? 5000),
+    {
+      client: this.client,
+      scanner: {
+        listFiles: async () => {
+          const files = this.app.vault.getAllLoadedFiles().filter((f) => f instanceof TFile) as TFile[];
+          const stats = await Promise.all(
+            files.map(async (f) => {
+              const stat = await this.app.vault.adapter.stat(f.path).catch(() => null);
+              return { path: f.path, size: stat?.size ?? 0 };
+            }),
+          );
+          return stats;
+        },
+      },
+    },
   );
 
   private statusItem: HTMLElement | null = null;
@@ -74,13 +89,13 @@ export default class SyncVaultPlugin extends Plugin {
 
     this.addSettingTab(
       new SyncVaultSettingsTab(this.app, this, this.state, this.auth, this.client, this.engine, () => {
-        this.engine.start();
+        void this.engine.start();
         this.setStatusBar("synced");
       }),
     );
 
     this.registerVaultEvents();
-    this.engine.start();
+    void this.engine.start();
   }
 
   private setStatusBar(status: SyncStatus): void {
