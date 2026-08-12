@@ -1,4 +1,4 @@
-import { Change, fromBase64, MAX_FILE_BYTES, normalizePath, toBase64 } from "@syncvault/shared";
+import { Change, fromBase64, isValidBase64, MAX_FILE_BYTES, normalizePath, toBase64 } from "@syncvault/shared";
 import { SyncState, QueuedChange } from "../state/SyncState";
 import { ChangeQueue } from "./ChangeQueue";
 import { VaultWatcher } from "../vault/VaultWatcher";
@@ -29,6 +29,7 @@ export interface EngineOptions {
 type AckResult =
   | { status: "accepted"; revision: number }
   | { status: "conflict"; conflictPath?: string }
+  | { status: "retry" }
   | { status: "rejected" };
 
 interface PendingAck {
@@ -64,12 +65,14 @@ export class SyncEngine {
     this.scanner = options.scanner;
     const handlers: ConnectionCallbacks = {
       onWelcome: (serverRevision, resyncRequired) => this.handleWelcome(serverRevision, resyncRequired),
-      onRemoteChange: (change) => void this.applyRemoteChange(change),
+      onRemoteChange: (change) => this.applyRemoteChange(change),
       onAccepted: (operationId, revision) =>
         this.settleAck(operationId, { status: "accepted", revision }),
       onConflict: (c) =>
         this.settleAck(c.operationId, { status: "conflict", conflictPath: c.conflictPath }),
       onRejected: (operationId, code, message) => this.handleRejected(operationId, code, message),
+      onAuthFailure: (message) => this.handleAuthFailure(message),
+      onRetry: (operationId, message) => this.handleRetry(operationId, message),
       onError: (message) => this.onNotice(`SyncVault: ${message}`, 6000),
       onStatusChange: (status) => this.handleConnectionStatus(status),
     };
@@ -117,8 +120,17 @@ export class SyncEngine {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    this.clearPendingAcks();
+    this.syncInFlight = false;
+    this.polling = false;
     this.paused = false;
     this.setStatus("idle");
+  }
+
+  async resetForRebuild(): Promise<void> {
+    this.stop();
+    this.ackTarget = 0;
+    await this.queue.clear();
   }
 
   /**
@@ -135,7 +147,7 @@ export class SyncEngine {
   }
 
   async syncNow(): Promise<void> {
-    if (!this.paused && !this.state.connected) {
+    if (!this.state.connected) {
       this.onNotice("SyncVault: not configured", 4000);
       return;
     }
@@ -163,6 +175,7 @@ export class SyncEngine {
       if (result.changes.length > 0) this.setStatus("downloading");
       for (const change of result.changes) {
         await this.applyRemoteChange(change);
+        if (this.paused) break;
       }
       await this.maybeSeed();
       await this.flushQueue();
@@ -184,6 +197,14 @@ export class SyncEngine {
     }
   }
 
+  private handleAuthFailure(message: string): void {
+    this.connection.disconnect();
+    this.clearPendingAcks();
+    this.paused = true;
+    this.setStatus("paused");
+    this.onNotice(`SyncVault: sync paused — ${message}. Reconnect the vault to continue.`, 10000);
+  }
+
   private async handleWelcome(serverRevision: number, resyncRequired: boolean): Promise<void> {
     if (resyncRequired) {
       this.onNotice("SyncVault: local history is older than the server retention window. Resync is not supported yet.", 10000);
@@ -191,7 +212,7 @@ export class SyncEngine {
       return;
     }
     this.setStatus("synced");
-    void this.flushQueue();
+    if (!this.paused) await this.flushQueue();
   }
 
   private async applyRemoteChange(change: Change): Promise<void> {
@@ -295,7 +316,8 @@ export class SyncEngine {
     switch (change.operation) {
       case "create":
       case "update": {
-        if (!change.payload) throw new Error("missing payload");
+        if (typeof change.payload !== "string") throw new Error("missing payload");
+        if (!isValidBase64(change.payload)) throw new Error("invalid payload");
         await this.vault.write(normalizePath(change.path), fromBase64(change.payload));
         return;
       }
@@ -320,6 +342,7 @@ export class SyncEngine {
         if (!this.connection.connected) break;
         const result = await this.sendAndWait(item);
         if (result === null) break;
+        if (result.status === "retry") break;
         if (result.status === "rejected") {
           // permanently rejected (e.g. legacy payload-less seed) — already
           // removed from the queue by handleRejected; do not advance the cursor
@@ -367,6 +390,19 @@ export class SyncEngine {
     clearTimeout(pending.timer);
     this.pendingAcks.delete(operationId);
     pending.resolve(result);
+  }
+
+  private clearPendingAcks(): void {
+    for (const pending of this.pendingAcks.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve({ status: "retry" });
+    }
+    this.pendingAcks.clear();
+  }
+
+  private handleRetry(operationId: string, message: string): void {
+    this.settleAck(operationId, { status: "retry" });
+    this.onNotice(`SyncVault: upload will retry: ${message}`, 6000);
   }
 
   private handleRejected(operationId: string, code: string, message: string): void {

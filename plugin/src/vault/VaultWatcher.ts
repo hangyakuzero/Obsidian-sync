@@ -36,21 +36,53 @@ export class VaultWatcher {
 
     const key = this.keyOf(ev);
     if (ev.kind === "delete") {
+      const hadCreate = this.pending.has(`create:${path}`);
+      const hadRename = this.pending.has(`rename:${path}`);
       this.pending.delete(`create:${path}`);
       this.pending.delete(`modify:${path}`);
-      this.pending.delete(`rename:${path}`);
+      if (!hadRename) this.pending.delete(`rename:${path}`);
+      if (hadCreate && !hadRename) {
+        this.scheduleFlush();
+        return;
+      }
     } else if (ev.kind === "rename") {
       const { oldPath } = ev;
-      this.pending.delete(`create:${oldPath}`);
-      this.pending.delete(`modify:${oldPath}`);
-      this.pending.delete(`delete:${oldPath}`);
-      this.pending.delete(`rename:${oldPath}`);
+      const pendingCreate = this.pending.get(`create:${oldPath}`);
+      const pendingRename = this.pending.get(`rename:${oldPath}`);
+      if (pendingCreate) {
+        // A newly-created file renamed before the debounce flush is still one
+        // create, just at its final path. There is no old server path to move.
+        this.pending.delete(`create:${oldPath}`);
+        this.pending.delete(`modify:${oldPath}`);
+        this.pending.delete(`delete:${oldPath}`);
+        this.pending.delete(`rename:${oldPath}`);
+        this.pending.delete(`create:${path}`);
+        this.pending.delete(`modify:${path}`);
+        this.pending.delete(`delete:${path}`);
+        this.pending.set(`create:${path}`, { kind: "create", path });
+        this.scheduleFlush();
+        return;
+      }
+      if (pendingRename?.kind === "rename") {
+        // Collapse a rename chain while retaining its original source.
+        this.pending.delete(`rename:${oldPath}`);
+        this.pending.delete(`rename:${path}`);
+        this.pending.set(`rename:${path}`, {
+          kind: "rename",
+          path,
+          oldPath: pendingRename.oldPath,
+        });
+        this.scheduleFlush();
+        return;
+      }
       this.pending.delete(`create:${path}`);
       this.pending.delete(`modify:${path}`);
       this.pending.delete(`delete:${path}`);
+      // Do not remove pending events for oldPath: a modify followed by a
+      // rename is an ordered modify-then-rename sequence.
     } else {
       this.pending.delete(`delete:${path}`);
-      this.pending.delete(`rename:${path}`);
+      if (ev.kind === "create") this.pending.delete(`rename:${path}`);
       this.pending.delete(ev.kind === "create" ? `modify:${path}` : `create:${path}`);
     }
     this.pending.set(key, ev);

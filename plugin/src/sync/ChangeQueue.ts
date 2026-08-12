@@ -27,10 +27,38 @@ export class ChangeQueue {
     const pending = this.state.pendingChanges;
     const touched = new Set<string>([change.path]);
     if (change.oldPath) touched.add(change.oldPath);
+
+    if (change.operation === "rename") {
+      const priorCreate = pending.find(
+        (c) => c.operation === "create" && c.path === change.oldPath,
+      );
+      if (priorCreate) {
+        // A local create followed by a rename has no server-side old path.
+        priorCreate.path = change.path;
+        priorCreate.oldPath = undefined;
+        await this.persist();
+        return;
+      }
+      const priorRename = pending.find(
+        (c) => c.operation === "rename" && c.path === change.oldPath,
+      );
+      if (priorRename) {
+        priorRename.path = change.path;
+        await this.persist();
+        return;
+      }
+    }
+
+    const preserveRename =
+      change.operation !== "rename" &&
+      pending.some((c) => c.operation === "rename" && c.path === change.path);
     for (const key of touched) {
       for (let i = pending.length - 1; i >= 0; i--) {
         const c = pending[i];
-        if (c.path === key || c.oldPath === key) {
+        if (
+          (c.path === key || c.oldPath === key) &&
+          !(preserveRename && c.operation === "rename" && c.path === change.path)
+        ) {
           pending.splice(i, 1);
         }
       }
@@ -55,6 +83,12 @@ export class ChangeQueue {
       pending.splice(index, 1);
       await this.persist();
     }
+  }
+
+  async clear(): Promise<void> {
+    if (this.state.pendingChanges.length === 0) return;
+    this.state.pendingChanges.splice(0, this.state.pendingChanges.length);
+    await this.persist();
   }
 
   async markAttempted(operationId: string): Promise<void> {

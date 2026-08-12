@@ -66,7 +66,7 @@ describe("ChangeQueue", () => {
     expect(queue.get("op-1")).toBeUndefined();
   });
 
-  it("delete supersedes pending write; rename supersedes both sides", async () => {
+  it("delete supersedes pending write and create-then-rename keeps the final path", async () => {
     const { state } = makeState();
     const queue = new ChangeQueue(state);
     await queue.enqueue(change({ operationId: "op-1", path: "a.md", operation: "modify" }));
@@ -78,9 +78,10 @@ describe("ChangeQueue", () => {
     await queue.enqueue(
       change({ operationId: "op-4", path: "d.md", oldPath: "c.md", operation: "rename" }),
     );
-    expect(queue.get("op-3")).toBeUndefined();
+    expect(queue.get("op-3")).toBeDefined();
+    expect(queue.get("op-3")?.path).toBe("d.md");
+    expect(queue.get("op-4")).toBeUndefined();
     expect(queue.size()).toBe(2);
-    expect(queue.items[1].operation).toBe("rename");
   });
 
   it("removes by operationId and tracks attempts", async () => {

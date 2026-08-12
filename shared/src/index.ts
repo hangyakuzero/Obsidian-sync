@@ -60,3 +60,19 @@ export function fromBase64(base64: string): Uint8Array {
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
 }
+
+export function isValidBase64(base64: string): boolean {
+  if (
+    base64.length % 4 === 1 ||
+    !/^[A-Za-z0-9+/]*={0,2}$/.test(base64) ||
+    (base64.includes("=") && base64.length % 4 !== 0)
+  ) {
+    return false;
+  }
+  try {
+    fromBase64(base64);
+    return true;
+  } catch {
+    return false;
+  }
+}

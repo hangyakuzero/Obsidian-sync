@@ -1,6 +1,6 @@
 import { ApiError, STATUS_FOR_CODE } from "./errors";
 import type { Env } from "./env";
-import type { Change } from "@syncvault/shared";
+import { fromBase64, isValidBase64, MAX_FILE_BYTES, normalizePath, type Change } from "@syncvault/shared";
 import { AccountDO } from "./durable-objects/AccountDO";
 import { VaultSyncDO } from "./durable-objects/VaultSyncDO";
 
@@ -112,7 +112,8 @@ async function route(request: Request, env: Env): Promise<Response> {
         return Response.json({
           currentRevision: statusRes.currentRevision,
           minRetainedRevision: statusRes.minRetainedRevision,
-          resyncRequired: since < statusRes.minRetainedRevision - 1,
+          resyncRequired:
+            since > statusRes.currentRevision || since < statusRes.minRetainedRevision - 1,
           changes,
         });
       }
@@ -122,6 +123,12 @@ async function route(request: Request, env: Env): Promise<Response> {
           throw new ApiError("UNAUTHORIZED", "invalid token");
         }
         const change = await request.json<Change>();
+        try {
+          normalizePath(change.path);
+          if (change.oldPath !== undefined) normalizePath(change.oldPath);
+        } catch (error) {
+          throw new ApiError("BAD_REQUEST", (error as Error).message);
+        }
         // Validate here (not only inside the DO) so the error code survives the
         // DO RPC boundary and maps to a clean 4xx response.
         if (
@@ -129,6 +136,12 @@ async function route(request: Request, env: Env): Promise<Response> {
           typeof change.payload !== "string"
         ) {
           throw new ApiError("PAYLOAD_REQUIRED", "file content required");
+        }
+        if (
+          (change.operation === "create" || change.operation === "update") &&
+          (!isValidBase64(change.payload!) || fromBase64(change.payload!).byteLength > MAX_FILE_BYTES)
+        ) {
+          throw new ApiError("BAD_REQUEST", "file content is not valid or exceeds the size limit");
         }
         const result = await env.VAULT_DO.getByName(rest[0]).submitChange(change, auth.deviceId);
         if (result.status === "accepted") {

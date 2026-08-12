@@ -5,6 +5,7 @@ import { SyncClient } from "./api/SyncClient";
 import { AuthManager } from "./auth/AuthManager";
 import { ChangeQueue } from "./sync/ChangeQueue";
 import { VaultWatcher, NormalizedEvent } from "./vault/VaultWatcher";
+import { ensureParentFolders } from "./vault/ensureParentFolders";
 import { SyncEngine, SyncStatus } from "./sync/SyncEngine";
 
 const STATUS_ICONS: Record<SyncStatus, string> = {
@@ -48,9 +49,23 @@ export default class SyncVaultPlugin extends Plugin {
     this.queue,
     this.watcher,
     {
-      write: (path, data) => this.app.vault.adapter.writeBinary(path, data.buffer as ArrayBuffer),
-      remove: (path) => this.app.vault.adapter.remove(path),
-      rename: (oldPath, newPath) => this.app.vault.adapter.rename(oldPath, newPath),
+      write: async (path, data) => {
+        await ensureParentFolders(this.app.vault.adapter, path);
+        await this.app.vault.adapter.writeBinary(path, data.buffer as ArrayBuffer);
+      },
+      remove: async (path) => {
+        if (await this.app.vault.adapter.exists(path)) {
+          await this.app.vault.adapter.remove(path);
+        }
+      },
+      rename: async (oldPath, newPath) => {
+        if (!(await this.app.vault.adapter.exists(oldPath))) {
+          if (await this.app.vault.adapter.exists(newPath)) return;
+          throw new Error(`rename source does not exist: ${oldPath}`);
+        }
+        await ensureParentFolders(this.app.vault.adapter, newPath);
+        await this.app.vault.adapter.rename(oldPath, newPath);
+      },
     },
     (status) => this.setStatusBar(status),
     (message, timeout) => this.notify(message, timeout),
@@ -68,11 +83,7 @@ export default class SyncVaultPlugin extends Plugin {
           return stats;
         },
         readBytes: async (path) => {
-          try {
-            return await this.app.vault.adapter.readBinary(path);
-          } catch {
-            return null;
-          }
+          return await this.app.vault.adapter.readBinary(path);
         },
       },
     },

@@ -60,7 +60,38 @@ describe("VaultWatcher", () => {
     watcher.track({ kind: "create", path: "old.md" });
     watcher.track({ kind: "rename", path: "new.md", oldPath: "old.md" });
     await watcher.flush();
-    expect(changes.map((c) => c.operation)).toEqual(["delete", "rename"]);
+    expect(changes.map((c) => c.operation)).toEqual(["delete"]);
+  });
+
+  it("collapses create-then-rename into a content-bearing create at the final path", async () => {
+    const { ctx, changes, reads } = makeContext();
+    const watcher = new VaultWatcher(ctx);
+    reads.set("new.md", encode("created"));
+    watcher.track({ kind: "create", path: "old.md" });
+    watcher.track({ kind: "rename", path: "new.md", oldPath: "old.md" });
+    await watcher.flush();
+    expect(changes).toHaveLength(1);
+    expect(changes[0]).toMatchObject({ operation: "create", path: "new.md" });
+    expect(changes[0].payload).toBeDefined();
+  });
+
+  it("keeps rename followed by modify as two ordered events", async () => {
+    const { ctx, changes, reads } = makeContext();
+    const watcher = new VaultWatcher(ctx);
+    reads.set("new.md", encode("updated"));
+    watcher.track({ kind: "rename", path: "new.md", oldPath: "old.md" });
+    watcher.track({ kind: "modify", path: "new.md" });
+    await watcher.flush();
+    expect(changes.map((c) => c.operation)).toEqual(["rename", "update"]);
+  });
+
+  it("keeps rename followed by delete as two ordered events", async () => {
+    const { ctx, changes } = makeContext();
+    const watcher = new VaultWatcher(ctx);
+    watcher.track({ kind: "rename", path: "new.md", oldPath: "old.md" });
+    watcher.track({ kind: "delete", path: "new.md" });
+    await watcher.flush();
+    expect(changes.map((c) => c.operation)).toEqual(["rename", "delete"]);
   });
 
   it("suppresses events for paths being applied remotely", async () => {

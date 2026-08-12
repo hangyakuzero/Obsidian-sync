@@ -1,4 +1,4 @@
-import type { Change } from "@syncvault/shared";
+import { isValidBase64, normalizePath, type Change } from "@syncvault/shared";
 
 export interface QueuedChange extends Change {
   attempts: number;
@@ -84,8 +84,14 @@ export class SyncState {
     const saved = await this.backend?.load();
     if (saved) {
       this.data = { ...DEFAULT_SYNC_DATA, pendingChanges: [], ...saved };
-      if (!Array.isArray(this.data.pendingChanges)) this.data.pendingChanges = [];
-      if (!Array.isArray(this.data.appliedPaths)) this.data.appliedPaths = [];
+      this.data.lastRevision = this.validRevision(this.data.lastRevision);
+      this.data.seeded = this.data.seeded === true;
+      this.data.pendingChanges = Array.isArray(this.data.pendingChanges)
+        ? this.data.pendingChanges.filter((change) => this.validQueuedChange(change))
+        : [];
+      this.data.appliedPaths = Array.isArray(this.data.appliedPaths)
+        ? this.data.appliedPaths.filter((path) => this.validPath(path))
+        : [];
     }
   }
 
@@ -145,8 +151,57 @@ export class SyncState {
       deviceName: undefined,
       deviceToken: undefined,
       lastRevision: 0,
+      pendingChanges: [],
       seeded: false,
       appliedPaths: [],
     });
+  }
+
+  private validRevision(value: unknown): number {
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  }
+
+  private validPath(path: unknown): path is string {
+    if (typeof path !== "string") return false;
+    try {
+      normalizePath(path);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private validQueuedChange(change: unknown): change is QueuedChange {
+    if (!change || typeof change !== "object") return false;
+    const item = change as Partial<QueuedChange>;
+    if (
+      typeof item.operationId !== "string" ||
+      typeof item.revision !== "number" ||
+      typeof item.deviceId !== "string" ||
+      typeof item.operation !== "string" ||
+      typeof item.baseRevision !== "number" ||
+      typeof item.timestamp !== "number" ||
+      typeof item.attempts !== "number" ||
+      !Number.isSafeInteger(item.revision) ||
+      item.revision < 0 ||
+      !Number.isSafeInteger(item.baseRevision) ||
+      item.baseRevision < 0 ||
+      !Number.isSafeInteger(item.attempts) ||
+      item.attempts < 0 ||
+      !this.validPath(item.path)
+    ) {
+      return false;
+    }
+    if (item.oldPath !== undefined && !this.validPath(item.oldPath)) return false;
+    if (
+      (item.operation === "create" || item.operation === "update") &&
+      (typeof item.payload !== "string" || !isValidBase64(item.payload))
+    ) {
+      return false;
+    }
+    return item.operation === "create" ||
+      item.operation === "update" ||
+      item.operation === "delete" ||
+      item.operation === "rename";
   }
 }

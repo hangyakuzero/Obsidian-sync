@@ -165,6 +165,20 @@ describe("HTTP sync endpoints", () => {
     expect((await empty.json()).error).toBe("PAYLOAD_REQUIRED");
     expect((await vault.status()).currentRevision).toBe(0);
 
+    const invalidPayload = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/changes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth(t) },
+      body: JSON.stringify(change({ deviceId: t.deviceId, payload: "%%%" })),
+    });
+    expect(invalidPayload.status).toBe(400);
+
+    const invalidPath = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/changes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: auth(t) },
+      body: JSON.stringify(change({ deviceId: t.deviceId, path: "../escape.md" })),
+    });
+    expect(invalidPath.status).toBe(400);
+
     // a real create is committed
     const push = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/changes`, {
       method: "POST",
@@ -212,5 +226,10 @@ describe("HTTP sync endpoints", () => {
     });
     expect(pull.status).toBe(200);
     expect(((await pull.json()) as { changes: Change[] }).changes).toHaveLength(0);
+
+    const staleCursor = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/sync?since=1`, {
+      headers: { Authorization: auth(t) },
+    });
+    expect((await staleCursor.json<{ resyncRequired: boolean }>()).resyncRequired).toBe(true);
   });
 });

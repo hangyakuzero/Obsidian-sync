@@ -1,5 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
-import { Change, ClientMessage, ServerMessage, normalizePath, MAX_FILE_BYTES, RETENTION_MS } from "@syncvault/shared";
+import {
+  Change,
+  ClientMessage,
+  ServerMessage,
+  fromBase64,
+  isValidBase64,
+  normalizePath,
+  MAX_FILE_BYTES,
+  RETENTION_MS,
+} from "@syncvault/shared";
 import { ApiError } from "../errors";
 import type { Env } from "../env";
 
@@ -107,11 +116,20 @@ export class VaultSyncDO extends DurableObject<Env> {
       if (typeof change.payload !== "string") {
         throw new ApiError("PAYLOAD_REQUIRED", "file content required");
       }
-      if (change.payload.length > MAX_PAYLOAD_BASE64) {
+      if (!isValidBase64(change.payload)) {
+        throw new ApiError("BAD_REQUEST", "file content is not valid Base64");
+      }
+      if (change.payload.length > MAX_PAYLOAD_BASE64 || fromBase64(change.payload).byteLength > MAX_FILE_BYTES) {
         throw new ApiError("PAYLOAD_TOO_LARGE", "file exceeds size limit");
       }
     }
-    const path = normalizePath(change.path);
+    let path: string;
+    try {
+      path = normalizePath(change.path);
+      if (change.oldPath !== undefined) normalizePath(change.oldPath);
+    } catch (error) {
+      throw new ApiError("BAD_REQUEST", (error as Error).message);
+    }
     const receipt = this.getReceipt(change.operationId);
     if (receipt !== null) {
       return { status: "accepted", revision: receipt };
@@ -126,7 +144,8 @@ export class VaultSyncDO extends DurableObject<Env> {
       return { status: "conflict", path, conflictPath: conflict.conflictPath, serverRevision: conflict.serverRevision };
     }
     const revision = this.commit(change, path);
-    this.broadcast(change, authedDeviceId);
+    const committed = this.getChangeByRevision(revision);
+    if (committed) this.broadcast(this.rowToChange(committed), authedDeviceId);
     return { status: "accepted", revision };
   }
 
@@ -303,12 +322,15 @@ export class VaultSyncDO extends DurableObject<Env> {
     // A client at revision R needs revisions R+1..: if the retained floor is
     // above R+1, part of that range was already garbage-collected.
     const resyncRequired = msg.lastRevision < state.min_retained_revision - 1;
-    this.send(ws, { type: "welcome", serverRevision: state.current_revision, resyncRequired });
     if (resyncRequired) {
+      this.send(ws, { type: "welcome", serverRevision: state.current_revision, resyncRequired });
       ws.close(4001, "resync required");
       return;
     }
     await this.catchUp(ws, msg.lastRevision);
+    // Deliver welcome after catch-up so clients can flush local uploads only
+    // after the ordered remote baseline has been applied.
+    this.send(ws, { type: "welcome", serverRevision: state.current_revision, resyncRequired: false });
   }
 
   private async catchUp(ws: WebSocket, lastRevision: number): Promise<void> {
@@ -381,8 +403,8 @@ export class VaultSyncDO extends DurableObject<Env> {
       );
       if (change.operation === "rename") {
         const newPath = normalizePath(change.oldPath!);
-        this.setPathState(path, revision, true);
-        this.setPathState(newPath, revision, false);
+        this.setPathState(path, revision, false);
+        this.setPathState(newPath, revision, true);
       } else if (change.operation === "delete") {
         this.setPathState(path, revision, true);
       } else {

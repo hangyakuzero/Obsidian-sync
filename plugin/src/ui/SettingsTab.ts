@@ -88,7 +88,7 @@ export class SyncVaultSettingsTab extends PluginSettingTab {
             new RebuildModal(this.app, this.state, this.client, "rebuild", () => {
               void this.engine.resume();
               this.display();
-            }).open();
+            }, () => this.engine.resetForRebuild()).open();
           }),
       )
       .addButton((b) =>
@@ -99,12 +99,13 @@ export class SyncVaultSettingsTab extends PluginSettingTab {
             new RebuildModal(this.app, this.state, this.client, "join", () => {
               void this.engine.resume();
               this.display();
-            }).open();
+            }, () => this.engine.resetForRebuild()).open();
           }),
       );
 
     new Setting(containerEl).addButton((b) =>
       b.setButtonText("Disconnect vault").onClick(async () => {
+        this.engine.stop();
         await this.state.disconnect();
         new Notice("SyncVault: vault disconnected");
         this.display();

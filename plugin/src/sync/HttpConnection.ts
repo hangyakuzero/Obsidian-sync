@@ -12,8 +12,6 @@ function isApiError(e: unknown): e is ApiError {
   );
 }
 
-const HTTP_ACK_TIMEOUT_MS = 30_000;
-
 /**
  * HTTP polling transport. Obsidian's `requestUrl` (Electron/Capacitor native)
  * is more dependable across desktop + mobile than renderer WebSockets, so this
@@ -47,14 +45,21 @@ export class HttpConnection implements Connection {
     changes: Change[];
     resyncRequired: boolean;
   }> {
-    const r = await this.client.pullChanges(
-      this.state.accountId ?? "",
-      this.state.vaultId ?? "",
-      this.state.deviceId ?? "",
-      this.state.deviceToken ?? "",
-      since,
-    );
-    return { currentRevision: r.currentRevision, changes: r.changes, resyncRequired: r.resyncRequired };
+    try {
+      const r = await this.client.pullChanges(
+        this.state.accountId ?? "",
+        this.state.vaultId ?? "",
+        this.state.deviceId ?? "",
+        this.state.deviceToken ?? "",
+        since,
+      );
+      return { currentRevision: r.currentRevision, changes: r.changes, resyncRequired: r.resyncRequired };
+    } catch (e) {
+      if (isApiError(e) && e.status === 401) {
+        this.callbacks.onAuthFailure?.("authentication expired; reconnect the vault");
+      }
+      throw e;
+    }
   }
 
   sendChange(change: Change): boolean {
@@ -75,9 +80,6 @@ export class HttpConnection implements Connection {
     change: Change,
     p: { accountId: string; vaultId: string; deviceId: string; token: string },
   ): Promise<void> {
-    const timeout = setTimeout(() => {
-      // the engine's own pending-ack window handles the timeout bookkeeping
-    }, HTTP_ACK_TIMEOUT_MS);
     try {
       const result = await this.client.pushChange(p.accountId, p.vaultId, p.deviceId, p.token, change);
       if (result.status === "accepted") {
@@ -91,13 +93,18 @@ export class HttpConnection implements Connection {
         });
       }
     } catch (e) {
-      clearTimeout(timeout);
-      if (isApiError(e) && e.status >= 400 && e.status < 500 && e.code !== "UNAUTHORIZED") {
+      if (isApiError(e) && e.status === 401) {
+        this.callbacks.onRetry?.(change.operationId, e.message);
+        this.callbacks.onAuthFailure?.("authentication expired; reconnect the vault");
+        return;
+      }
+      if (isApiError(e) && e.status >= 400 && e.status < 500) {
         // Permanent rejection (payload required, bad path, too large):
         // drop the change and keep sync moving instead of retrying forever.
         this.callbacks.onRejected?.(change.operationId, e.code, e.message);
         return;
       }
+      this.callbacks.onRetry?.(change.operationId, (e as Error).message);
       this.callbacks.onError(`push failed: ${(e as Error).message}`);
     }
   }

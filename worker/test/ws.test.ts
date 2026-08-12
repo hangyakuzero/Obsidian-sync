@@ -149,7 +149,7 @@ describe("websocket sync", () => {
     const received = await changeOnB;
     expect(received).toMatchObject({
       type: "change",
-      change: { operation: "create", path: "hello.md" },
+      change: { operation: "create", path: "hello.md", revision: 1 },
     });
     const revB = (received as { type: "change"; change: Change }).change.revision;
     wsB.send(JSON.stringify({ type: "ack", revision: revB } satisfies ClientMessage));

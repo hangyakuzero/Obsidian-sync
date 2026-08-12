@@ -6,6 +6,14 @@ import { execSync } from "node:child_process";
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const pluginDir = resolve(root, "plugin");
 const releaseDir = resolve(root, "release");
+execSync("npm run build --workspace plugin", {
+  cwd: root,
+  env: {
+    ...process.env,
+    SYNCVAULT_SERVER_URL: process.env.SYNCVAULT_SERVER_URL ?? "https://syncvault.hangyakuzero.workers.dev",
+  },
+  stdio: "inherit",
+});
 const version = JSON.parse(readFileSync(resolve(pluginDir, "package.json"), "utf8")).version;
 
 const target = resolve(releaseDir, `syncvault-${version}`);

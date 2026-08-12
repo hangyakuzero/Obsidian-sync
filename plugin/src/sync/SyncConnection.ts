@@ -24,10 +24,12 @@ export interface ConnectionParams {
 
 export interface ConnectionCallbacks {
   onWelcome(serverRevision: number, resyncRequired: boolean): void;
-  onRemoteChange(change: Change): void;
+  onRemoteChange(change: Change): void | Promise<void>;
   onAccepted(operationId: string, revision: number): void;
   onConflict(opts: { operationId: string; path: string; conflictPath?: string; serverRevision: number }): void;
   onRejected?(operationId: string, code: string, message: string): void;
+  onAuthFailure?(message: string): void;
+  onRetry?(operationId: string, message: string): void;
   onError(message: string): void;
   onStatusChange(status: ConnectionStatus): void;
 }
@@ -41,6 +43,7 @@ export class SyncConnection implements Connection {
   private manualClose = false;
   private retryIndex = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private remoteChain: Promise<void> = Promise.resolve();
 
   constructor(
     private params: () => ConnectionParams,
@@ -141,10 +144,14 @@ export class SyncConnection implements Connection {
     switch (msg.type) {
       case "welcome":
         this.setStatus("open");
-        this.callbacks.onWelcome(msg.serverRevision, msg.resyncRequired);
+        this.remoteChain = this.remoteChain
+          .then(() => this.callbacks.onWelcome(msg.serverRevision, msg.resyncRequired))
+          .catch(() => undefined);
         break;
       case "change":
-        this.callbacks.onRemoteChange(msg.change);
+        this.remoteChain = this.remoteChain
+          .then(() => this.callbacks.onRemoteChange(msg.change))
+          .catch(() => undefined);
         break;
       case "accepted":
         this.callbacks.onAccepted(msg.operationId, msg.revision);

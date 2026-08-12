@@ -20,6 +20,7 @@ export class RebuildModal extends Modal {
     private client: SyncClient,
     private mode: "rebuild" | "join",
     private onDone: () => void,
+    private beforeReset: () => Promise<void>,
   ) {
     super(app);
   }
@@ -75,6 +76,7 @@ export class RebuildModal extends Modal {
       return;
     }
     try {
+      await this.beforeReset();
       if (rebuild) {
         if (!this.password) {
           new Notice("SyncVault: account password required", 5000);
