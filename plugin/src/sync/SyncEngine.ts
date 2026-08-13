@@ -9,7 +9,7 @@ import { SyncConnection, ConnectionStatus, ConnectionCallbacks, Connection } fro
 import { HttpConnection } from "./HttpConnection";
 import { SyncClient } from "../api/SyncClient";
 
-export type SyncStatus = "idle" | "syncing" | "downloading" | "uploading" | "conflict" | "offline" | "synced" | "paused";
+export type SyncStatus = "idle" | "syncing" | "downloading" | "uploading" | "offline" | "synced" | "paused";
 
 export interface VaultOps {
   write(path: string, data: Uint8Array): Promise<void>;
@@ -38,7 +38,6 @@ export interface EngineOptions {
 
 type AckResult =
   | { status: "accepted"; revision: number }
-  | { status: "conflict"; conflictPath?: string }
   | { status: "retry" }
   | { status: "rejected" };
 
@@ -77,7 +76,6 @@ export class SyncEngine {
   private scanner?: SeedScanner;
   private paused = false;
   private consecutiveAuthFailures = 0;
-  private joinBackup = false;
   private resyncBlocked = false;
   private staging?: Staging;
   private journal: Journal;
@@ -108,8 +106,6 @@ export class SyncEngine {
       onRemoteChange: (change) => this.applyRemoteChange(change),
       onAccepted: (operationId, revision) =>
         this.settleAck(operationId, { status: "accepted", revision }),
-      onConflict: (c) =>
-        this.settleAck(c.operationId, { status: "conflict", conflictPath: c.conflictPath }),
       onRejected: (operationId, code, message) => this.handleRejected(operationId, code, message),
       onAuthFailure: (message) => this.handleAuthFailure(message),
       onAuthed: () => {
@@ -176,7 +172,6 @@ export class SyncEngine {
     this.syncInFlight = false;
     this.polling = false;
     this.paused = false;
-    this.joinBackup = false;
     this.applyFailureCount = 0;
     this.setStatus("idle");
   }
@@ -197,7 +192,7 @@ export class SyncEngine {
     this.resyncBlocked = false;
     this.applyFailureCount = 0;
     this.lastApplyFailureAt = 0;
-    if (this.statusValue === "paused" || this.statusValue === "conflict") {
+    if (this.statusValue === "paused") {
       this.setStatus("syncing");
     }
     if (this.pollTimer === null) {
@@ -226,7 +221,6 @@ export class SyncEngine {
     try {
       const capped = await this.converge(gen);
       if (gen !== this.generation) return;
-      if (!capped && !this.paused) this.joinBackup = false;
       if (this.paused) return;
       if (capped) {
         // Revisions may still be arriving; never show a false "Synced".
@@ -326,7 +320,7 @@ export class SyncEngine {
       `SyncVault: ${message ?? "local history is older than the server retention window. Resync is not supported yet."}`,
       10000,
     );
-    this.setStatus("conflict");
+    this.setStatus("paused");
   }
 
   private async handleWelcome(serverRevision: number, resyncRequired: boolean): Promise<void> {
@@ -372,7 +366,7 @@ export class SyncEngine {
       this.lastApplyFailureAt = now;
       const message = (e as Error).message;
       if (this.applyFailureCount < MAX_APPLY_FAILURES) {
-        this.setStatus("conflict");
+        this.setStatus("syncing");
         this.onNotice(
           `SyncVault: could not apply "${change.path}": ${message} — retrying (${this.applyFailureCount}/${MAX_APPLY_FAILURES}).`,
           6000,
@@ -400,7 +394,7 @@ export class SyncEngine {
   /**
    * First-run seed: enqueue every local file as a "create" so a device's
    * existing vault reaches the server. Pulled paths (marked applied) are
-   * skipped, preventing duplicates and false conflicts on joined devices.
+   * skipped, preventing duplicate re-uploads on devices that just joined.
    */
   private async maybeSeed(): Promise<void> {
     if (this.state.seeded) return;
@@ -565,9 +559,8 @@ export class SyncEngine {
           data = fromBase64(change.payload) as Uint8Array<ArrayBuffer>;
           sha = await sha256Hex(data);
         }
-        await this.ensureNoBlockingFile(normalizePath(change.path), change);
+        await this.removeBlockingAncestors(normalizePath(change.path));
         const path = normalizePath(change.path);
-        if (this.joinBackup) await this.backupIfDivergent(path, change, data);
         this.watcher.expect(path, "content", { sha });
         await this.vault.write(path, data);
         return;
@@ -596,7 +589,7 @@ export class SyncEngine {
    *   did — either way the goal state holds; journal it and move on.
    * - both missing: genuinely ambiguous; pausing (never ACKing) is safer than
    *   guessing.
-   * - occupied destination: preserve it as a queued conflict copy first.
+   * - occupied destination: removed — the incoming revision wins.
    * - case-only rename: two-step through a unique temp name in the same folder
    *   because case-insensitive filesystems treat old==new.
    */
@@ -621,13 +614,11 @@ export class SyncEngine {
     if (newKind === "folder") {
       throw new Error("rename target is a folder");
     }
-    if (newKind === "file") {
-      const conflictPath = await this.freshLocalConflictPath(newPath, change);
-      const bytes = await this.vault.readFile(newPath);
-      if (bytes === null) throw new Error("could not read the occupied rename target");
-      this.watcher.expect(conflictPath, "rename", { oldPath: newPath });
-      await this.vault.rename(newPath, conflictPath);
-      await this.enqueueConflictCopy(conflictPath, bytes);
+    if (newKind === "file" && !caseOnly) {
+      // Last-write-wins: the incoming rename replaces the occupied
+      // destination; never preserve it under a conflict copy.
+      this.watcher.expect(newPath, "delete");
+      await this.vault.remove(newPath);
     }
     if (caseOnly) {
       // Case-insensitive filesystems see oldPath === newPath; go through a
@@ -645,10 +636,10 @@ export class SyncEngine {
 
   /**
    * A remote write must never silently fail because a file sits where a
-   * folder belongs: back the blocking file up as a queued conflict copy, then
-   * let the write create the folders.
+   * folder belongs: remove the blocking file, then let the write create the
+   * folders. The incoming revision wins; no backup copy is made.
    */
-  private async ensureNoBlockingFile(path: string, change: Change): Promise<void> {
+  private async removeBlockingAncestors(path: string): Promise<void> {
     const parts = path.split("/").filter(Boolean);
     let current = "";
     for (let i = 0; i < parts.length - 1; i++) {
@@ -656,34 +647,17 @@ export class SyncEngine {
       const kind = await this.vault.stat(current);
       if (kind === null) break; // deeper ancestors do not exist yet
       if (kind === "file") {
-        const conflictPath = await this.freshLocalConflictPath(current, change);
-        const bytes = await this.vault.readFile(current);
-        if (bytes === null) throw new Error("could not read the blocking ancestor file");
-        this.watcher.expect(conflictPath, "rename", { oldPath: current });
-        await this.vault.rename(current, conflictPath);
-        await this.enqueueConflictCopy(conflictPath, bytes);
+        this.watcher.expect(current, "delete");
+        await this.vault.remove(current);
         return;
       }
     }
   }
 
-  private async enqueueConflictCopy(path: string, bytes: Uint8Array<ArrayBuffer>): Promise<void> {    const operationId = this.newOperationId();
-    if (this.staging) await this.staging.save(operationId, bytes);
-    await this.enqueueLocal({
-      operationId,
-      revision: 0,
-      deviceId: "",
-      path,
-      operation: "create",
-      baseRevision: this.state.lastRevision,
-      timestamp: Date.now(),
-      content: await this.contentFor(bytes),
-    });
-  }
-
   /** Queue a local file for upload (used by the visual-appearance mirror).
    * Small files travel as inline base64 payloads like captured changes;
-   * larger ones are staged and sent via their content descriptor. */
+   * larger ones are staged and sent via their content descriptor. Every size
+   * is queued at its original logical path. */
   async enqueueVisualChange(path: string, bytes: Uint8Array<ArrayBuffer>): Promise<void> {
     if (bytes.byteLength === 0 || bytes.byteLength <= MAX_INLINE_BYTES) {
       await this.enqueueLocal({
@@ -698,40 +672,19 @@ export class SyncEngine {
       });
       return;
     }
-    await this.enqueueConflictCopy(path, bytes);
-  }
-
-  /** Enter "join" recovery mode: remote applies back up divergent local files
-   * as conflict copies instead of silently overwriting them. Cleared once the
-   * baseline pull converges. */
-  enterJoinMode(): void {
-    this.joinBackup = true;
-  }
-
-  /** During join, preserve any local file that differs from the incoming
-   * remote baseline as a conflict copy before the target is overwritten. */
-  private async backupIfDivergent(
-    path: string,
-    change: Change,
-    incoming: Uint8Array<ArrayBuffer>,
-  ): Promise<void> {
-    const kind = await this.vault.stat(path);
-    if (kind !== "file") return;
-    const local = await this.vault.readFile(path);
-    if (local === null || this.bytesEqual(local, incoming)) return;
-    const saved = local as Uint8Array<ArrayBuffer>;
-    const conflictPath = await this.freshLocalConflictPath(path, change);
-    await this.enqueueConflictCopy(conflictPath, saved);
-    this.watcher.expect(conflictPath, "content", { sha: await sha256Hex(saved) });
-    await this.vault.write(conflictPath, saved);
-  }
-
-  private bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-    if (a.byteLength !== b.byteLength) return false;
-    for (let i = 0; i < a.byteLength; i++) {
-      if (a[i] !== b[i]) return false;
-    }
-    return true;
+    const operationId = this.newOperationId();
+    if (this.staging) await this.staging.save(operationId, bytes);
+    await this.enqueueLocal({
+      operationId,
+      revision: 0,
+      deviceId: "",
+      path,
+      operation: "create",
+      baseRevision: this.state.lastRevision,
+      timestamp: Date.now(),
+      content: await this.contentFor(bytes),
+      stagedFile: operationId,
+    } as QueuedChange);
   }
 
   /** Number of local files the initial seed would upload (for recovery safety
@@ -750,27 +703,6 @@ export class SyncEngine {
     } catch {
       return -1;
     }
-  }
-
-  /** Deterministic sibling name mirroring the server's conflict convention. */
-  private async freshLocalConflictPath(path: string, change: Change): Promise<string> {
-    const slash = path.lastIndexOf("/");
-    const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
-    const name = slash >= 0 ? path.slice(slash + 1) : path;
-    const dot = name.lastIndexOf(".");
-    const stem = dot > 0 ? name.slice(0, dot) : name;
-    const ext = dot > 0 ? name.slice(dot) : "";
-    const stamp = new Date(change.timestamp || Date.now())
-      .toISOString()
-      .replace(/[-:T]/g, "")
-      .slice(0, 12);
-    for (let i = 0; i < 100; i++) {
-      const suffix = i === 0 ? "" : `-${i}`;
-      const candidate = `${dir}${stem} (conflict-local-${stamp})${suffix}${ext}`;
-      if (candidate === path) continue;
-      if ((await this.vault.stat(candidate)) === null) return candidate;
-    }
-    throw new Error("could not allocate a conflict path");
   }
 
   private caseRenameTemp(path: string): string {
@@ -873,12 +805,6 @@ export class SyncEngine {
           }
           // HTTP: the pusher receives its own change via the next pull, and
           // the cursor advances at apply time in applyRemoteChange.
-        } else {
-          // The server committed the conflicting version as a conflict copy and
-          // broadcast it to this device; the copy is applied via applyRemoteChange.
-          await this.queue.removeDropped(item.operationId);
-          if (item.stagedFile) await this.staging?.remove(item.stagedFile);
-          this.setStatus("conflict");
         }
       }
     } finally {
@@ -887,7 +813,7 @@ export class SyncEngine {
         if (this.paused) {
           this.setStatus("paused");
         } else if (this.resyncBlocked) {
-          this.setStatus("conflict");
+          this.setStatus("paused");
         } else {
           this.setStatus(this.queue.size() > 0 ? "syncing" : "synced");
         }

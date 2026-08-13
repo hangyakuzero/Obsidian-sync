@@ -162,14 +162,17 @@ server contains another device's appearance change.
 Do not include plugin settings, workspace state, or device-specific mobile
 layout in this feature.
 
-### 5. Conflicts and File Safety
+### 5. Last-write-wins and File Safety
 
-Use the existing conflict behavior for enabled theme/snippet files:
+Theme and snippet files use the same server-revision last-write-wins policy as
+normal vault files:
 
-- Stale writes become conflict copies.
-- No local file is silently overwritten by a stale local edit.
-- A remote rename into an occupied destination must preserve the existing
-  destination before applying the rename.
+- Stale writes are accepted and committed as the latest server revision.
+- Remote writes replace local bytes at the target path.
+- A remote rename into an occupied destination removes the destination before
+  applying the rename.
+- Existing files whose names contain `conflict-` remain ordinary files and are
+  not cleaned up by synchronization.
 
 Theme and snippet files are plain text, but they still use the normal Base64,
 path, payload-size, and queue validation rules.
@@ -189,7 +192,7 @@ Add unit tests for:
 - Disabled-device policy handling and cursor advancement.
 - Persisted settings migration and invalid-setting fallback.
 - Appearance application ordering after theme files.
-- Existing-destination rename conflict behavior.
+- Existing-destination rename replacement behavior.
 
 Add Android manual acceptance tests:
 

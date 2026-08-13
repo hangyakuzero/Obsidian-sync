@@ -2,13 +2,72 @@
 
 Source of truth: `implementation.md`. Diagnosis appendix: `bugfix.md`.
 
-Three phases; each ends green on root tests + plugin build. Phase 1 is the
-reliability cut (no wire-format change, backward compatible). Phase 2 is the
-chunked protocol (16 MiB). Phase 3 is visual sync + Recover guide.
+Three completed phases established the current sync implementation. The next
+planned phase removes conflict generation and changes mutation handling to
+server-revision last-write-wins. Each work item ends green on plugin tests,
+worker tests, type checks, and production builds.
+
+## Phase 4 — Remove conflict generation and use last-write-wins
+
+Source of truth: `conflict-removal-plan.md`.
+
+### LWW1. Server accepts every valid mutation
+
+- `worker/src/durable-objects/VaultSyncDO.ts`: remove `detectConflict`,
+  `commitCopy`, `freshConflictPath`, and collision-based rejection.
+- `submitChange` and `completeUpload`: commit every valid mutation and return
+  `accepted`; stale `baseRevision` values no longer create copies.
+- Keep receipts, content verification, retention checks, and authentication.
+- Keep existing path-state columns for storage compatibility, but do not use
+  them to generate conflict behavior.
+
+### LWW2. Remove conflict wire responses
+
+- `shared/src/index.ts`: remove the conflict server-message variant.
+- `plugin/src/api/SyncClient.ts`: make `PushResult` accepted-only.
+- `plugin/src/sync/SyncConnection.ts` and `HttpConnection.ts`: remove
+  `onConflict` and conflict response branches.
+- `worker/src/index.ts`: remove conflict response serialization and the
+  conflict-path error mapping.
+
+### LWW3. Apply the latest remote filesystem state
+
+- `plugin/src/sync/SyncEngine.ts`: remote writes overwrite targets.
+- Occupied rename destinations are removed before the incoming rename.
+- Blocking ancestor files are removed before required folders are created.
+- Delete `enqueueConflictCopy`, `freshLocalConflictPath`,
+  `backupIfDivergent`, `enterJoinMode`, and `joinBackup`.
+- Large visual files remain staged, but are queued at their original path.
+- Existing files named `conflict-*` are left untouched and sync normally.
+
+### LWW4. Simplify status and recovery UX
+
+- Remove the `conflict` sync status and conflict notices.
+- Use `syncing` for retryable apply errors and `paused` for actionable fatal
+  errors.
+- `RecoverModal` and `SettingsTab`: joining a rebuilt baseline overwrites
+  local files; remove the join-backup callback and copy-preservation text.
+
+### LWW5. Tests and documentation
+
+- Replace worker stale-write conflict tests with accepted last-write-wins
+  tests.
+- Add rapid-save, offline-reconnect, occupied-rename, file/folder collision,
+  recovery-overwrite, and no-new-copy tests.
+- Update `README.md`, `implementation.md`, `bugfix.md`, `phase2.md`,
+  `plan.md`, and `planfin.md` to remove the conflict-preservation policy.
+
+### LWW6. Verification and release
+
+- Run all plugin and worker tests, type checks, and production builds.
+- Run `wrangler deploy --dry-run`, then deploy the worker.
+- Build and package the proposed `v0.3.0` plugin release.
+- Commit implementation and tests, commit the release package, tag `v0.3.0`,
+  and push `main` plus the tag.
 
 ## Phase 1 — Reliability cut (W1–W8)
 
-### W1. Ordered queue reducer + causal parents
+### W1. Ordered queue reducer + causal parents (superseded for conflict decisions)
 - `plugin/src/sync/ChangeQueue.ts`: replace destructive path coalescing with an
   ordered reducer. Preserve chains (update→rename, rename→update); fold
   delete-then-rename-into-target; collapse superseded ops and **rewire
@@ -16,9 +75,9 @@ chunked protocol (16 MiB). Phase 3 is visual sync + Recover guide.
   rebase `baseRevision` (capture-time base).
 - `shared/src/index.ts`: `Change.causalParents?: string[]` (validate: ≤16, valid
   op ids).
-- `worker VaultSyncDO`: `path_state.last_operation_id`; conflict check allows a
-  stale path when its `last_operation_id` is a declared same-device parent.
-  Unrelated remote changes still conflict.
+- `worker VaultSyncDO`: the ordered queue remains useful for preserving local
+  operation order, but server conflict checks and same-device conflict
+  exceptions are superseded by Phase 4 LWW1.
 
 ### W2. Cursor rules + converge loop
 - `Connection.advanceCursorOnAccept`: HTTP false, WS true (WS: `accepted` queued
@@ -44,12 +103,12 @@ chunked protocol (16 MiB). Phase 3 is visual sync + Recover guide.
 - `SyncEngine.apply`:
   - journal-proven ops are skipped on redelivery (lost ACK / HTTP pull).
   - delete: missing target = no-op.
-  - rename: source missing + dest exists → no-op (journaled); both missing →
-    pause once, never ACK; occupied destination → deterministic
-    `(conflict-local-…)` copy queued for sync, then rename; case-only rename →
+   - rename: source missing + dest exists → no-op (journaled); both missing →
+     pause once, never ACK; occupied destination → remove destination, then
+     rename; case-only rename →
     two-step through `.`-prefixed `-syncvault-{hex}` temp in the same folder.
-  - file-vs-folder ancestor → blocking file backed up as queued conflict copy,
-    then folders are created by the write.
+   - file-vs-folder ancestor → blocking file removed, then folders are created
+     by the write.
 - Before applying a remote change, flush pending local observations for its
   paths first (`applyRemoteChange` → `watcher.flush()`).
 
@@ -73,11 +132,8 @@ chunked protocol (16 MiB). Phase 3 is visual sync + Recover guide.
   re-scheduled inside `alarm()` — automatic GC never starts).
 - Purge `operation_receipts` with pruned changes; purge delete tombstones from
   `path_state` once unreferenced; keep live-file metadata.
-- Identical-content dedupe: `path_state.content_hash`; stale upsert with same
-  hash → receipt + accepted, no revision, no conflict copy.
-- Case collisions: `collision_key` (NFC + casefold); same-key **live** other
-  path → deterministic conflict copy for the second version; case-only rename
-  commits cleanly (dest tombstone created by the rename itself).
+- Content hashes remain integrity checks. Conflict-path generation and
+  collision-based copies are superseded by Phase 4 LWW1.
 - SQLite storage-full → `INSUFFICIENT_STORAGE` (507), client keeps queue.
 
 ### W7. Request deadlines
@@ -142,7 +198,8 @@ chunked protocol (16 MiB). Phase 3 is visual sync + Recover guide.
     out-of-scope `.obsidian` files (workspace, hotkeys, plugin data) stay ignored.
   - Scanner: startup + manual ("Sync visual files now") + 30-min cadence; recurses
     theme trees (depth ≤ 8); 16 MiB cap with notice. Small files (≤1 MiB) inline
-    payload, larger staged via `engine.enqueueVisualChange` (conflict-copy path),
+     payload, larger staged via `engine.enqueueVisualChange` at the original
+     logical path,
     zero-byte → empty payload; server identical-content dedupe makes blind
     re-scans harmless. Disabled → event capture dropped and remote applies
     advance the cursor without writing.
@@ -156,11 +213,8 @@ chunked protocol (16 MiB). Phase 3 is visual sync + Recover guide.
     refuses to wipe server history when this device has no syncable files or
     the scan fails) and "Pull rebuilt baseline" (join: cursor reset, no local
     seeding).
-  - Join preserves local files as conflict copies: `engine.enterJoinMode()`
-    sets a one-shot `joinBackup` flag; during the baseline pull, any remote
-    create/update whose target has differing local bytes backs the local file
-    up under `(conflict-local-…)` and queues it for upload before overwriting.
-    Flag auto-clears when the pull converges (and on stop).
+- Join overwrites divergent local files with the rebuilt baseline. Existing
+  conflict-named files remain untouched; no new backup copy is created.
   - `RebuildModal` deleted; Settings "Rescue" → "Recover sync".
   - Tests: join divergent-backup (regex path, target overwritten, backup
     queued, ACK), identical-file untouched, `countSyncableFiles` filter
@@ -168,5 +222,5 @@ chunked protocol (16 MiB). Phase 3 is visual sync + Recover guide.
 - Release: plugin feature version + deploy.
 
 ## Defaults (locked by implementation.md)
-- Retention 7 days; max file 16 MiB chunked; visual on by default; conflicts
-  preserve both versions; guided authoritative-device recovery.
+- Retention 7 days; max file 16 MiB chunked; visual on by default; server
+  revision last-write-wins; guided authoritative-device recovery.

@@ -157,7 +157,7 @@ export class VaultSyncDO extends DurableObject<Env> {
     change: Change,
     authedDeviceId: string,
     opts: { strict?: boolean } = {},
-  ): Promise<{ status: "accepted"; revision: number } | { status: "conflict"; path: string; conflictPath?: string; serverRevision: number }> {
+  ): Promise<{ status: "accepted"; revision: number }> {
     const strict = opts.strict ?? false;
     if (change.deviceId !== authedDeviceId) {
       throw new ApiError("UNAUTHORIZED", "change deviceId does not match authenticated device");
@@ -215,23 +215,14 @@ export class VaultSyncDO extends DurableObject<Env> {
       throw new ApiError("BAD_REQUEST", (error as Error).message);
     }
     // Retried/stale writes containing exactly the bytes already live are a
-    // receipt-only success. This avoids both a false conflict and a redundant
-    // revision without weakening different-content conflict protection.
+    // receipt-only success. Identical content needs no new revision, and the
+    // receipt keeps re-uploads idempotent.
     if ((change.operation === "create" || change.operation === "update") && change.content) {
       const live = this.pathState(path);
       if (live && !live.deleted && live.content_hash === change.content.hash && live.last_revision > change.baseRevision) {
         this.ctx.storage.sql.exec("INSERT INTO operation_receipts (operation_id, revision) VALUES (?, ?)", change.operationId, live.last_revision);
         return { status: "accepted", revision: live.last_revision };
       }
-    }
-    const conflict = this.detectConflict(change, path);
-    if (conflict) {
-      if (conflict.conflictPath) {
-        const revision = this.commitCopy(conflict.conflictPath, change);
-        const committed = this.getChangeByRevision(revision);
-        if (committed) this.broadcast(this.rowToChange(committed), undefined);
-      }
-      return { status: "conflict", path, conflictPath: conflict.conflictPath, serverRevision: conflict.serverRevision };
     }
     const revision = this.commit(change, path);
     await this.ctx.storage.setAlarm(Date.now() + 24 * 60 * 60 * 1000);
@@ -321,7 +312,7 @@ export class VaultSyncDO extends DurableObject<Env> {
     this.exec("INSERT OR REPLACE INTO upload_chunks (operation_id, chunk_index, data) VALUES (?, ?, ?)", operationId, index, data);
   }
 
-  async completeUpload(operationId: string, deviceId: string): Promise<{ status: "accepted"; revision: number } | { status: "conflict"; path: string; conflictPath?: string; serverRevision: number }> {
+  async completeUpload(operationId: string, deviceId: string): Promise<{ status: "accepted"; revision: number }> {
     const session = this.uploadSession(operationId);
     if (!session || session.device_id !== deviceId) throw new ApiError("NOT_FOUND", "upload session not found");
     const change = JSON.parse(session.change_json) as Change;
@@ -331,24 +322,19 @@ export class VaultSyncDO extends DurableObject<Env> {
     const digest = await this.sha256(bytes);
     if (digest !== session.content_hash) throw new ApiError("HASH_MISMATCH", "uploaded bytes do not match declared SHA-256");
     const result = await this.submitChange(change, deviceId, { strict: true });
-    if (result.status === "accepted" || result.status === "conflict") {
-      // A conflict copy is also a committed mutation; its receipt points at
-      // the copy revision and therefore owns the uploaded bytes.
-      const revision = result.status === "accepted" ? result.revision : this.getReceipt(operationId);
-      if (revision === null) throw new ApiError("INTERNAL", "missing upload receipt");
-      this.ctx.storage.transactionSync(() => {
-        // Two devices uploading identical content both dedupe to the same
-        // receipt revision; OR IGNORE makes the copy idempotent.
-        this.exec(
-          "INSERT OR IGNORE INTO change_chunks (revision, chunk_index, data) SELECT ?, chunk_index, data FROM upload_chunks WHERE operation_id = ?",
-          revision,
-          operationId,
-        );
-        this.ctx.storage.sql.exec("DELETE FROM upload_chunks WHERE operation_id = ?", operationId);
-        this.ctx.storage.sql.exec("DELETE FROM upload_sessions WHERE operation_id = ?", operationId);
-      });
-    }
-    return result;
+    const revision = result.revision;
+    this.ctx.storage.transactionSync(() => {
+      // The uploaded chunks become the committed revision's content; the
+      // OR IGNORE keeps the copy idempotent for deduped identical uploads.
+      this.exec(
+        "INSERT OR IGNORE INTO change_chunks (revision, chunk_index, data) SELECT ?, chunk_index, data FROM upload_chunks WHERE operation_id = ?",
+        revision,
+        operationId,
+      );
+      this.ctx.storage.sql.exec("DELETE FROM upload_chunks WHERE operation_id = ?", operationId);
+      this.ctx.storage.sql.exec("DELETE FROM upload_sessions WHERE operation_id = ?", operationId);
+    });
+    return { status: "accepted", revision };
   }
 
   async getChangeChunk(revision: number, index: number): Promise<Uint8Array> {
@@ -478,17 +464,7 @@ export class VaultSyncDO extends DurableObject<Env> {
             strict: attached.capabilities?.includes(CHUNK_CAPABILITY) ?? false,
           });
           this.touch(attached.deviceId!);
-          if (result.status === "accepted") {
-            this.send(ws, { type: "accepted", operationId: msg.change.operationId, revision: result.revision });
-          } else {
-            this.send(ws, {
-              type: "conflict",
-              operationId: msg.change.operationId,
-              path: result.path,
-              conflictPath: result.conflictPath,
-              serverRevision: result.serverRevision,
-            });
-          }
+          this.send(ws, { type: "accepted", operationId: msg.change.operationId, revision: result.revision });
           break;
         }
         case "ack":
@@ -562,50 +538,6 @@ export class VaultSyncDO extends DurableObject<Env> {
     }
   }
 
-  private detectConflict(
-    change: Change,
-    path: string,
-  ): { serverRevision: number; conflictPath?: string } | null {
-    const pathState = this.pathState(path);
-    const pathRev = pathState?.last_revision ?? null;
-    const allowedStale = (state: PathState | null) => Boolean(
-      state && change.causalParents?.includes(state.last_operation_id ?? "") && state.last_revision > change.baseRevision,
-    );
-    switch (change.operation) {
-      case "create":
-      case "update": {
-        if (pathRev !== null && pathRev > change.baseRevision && !allowedStale(pathState)) {
-          return { serverRevision: pathRev, conflictPath: this.freshConflictPath(path, change) };
-        }
-        const collision = this.collisionPath(path);
-        if (collision && collision !== path) return { serverRevision: this.pathRevision(collision) ?? 0, conflictPath: this.freshConflictPath(path, change) };
-        return null;
-      }
-      case "delete": {
-        if (pathRev !== null && pathRev > change.baseRevision && !allowedStale(pathState)) {
-          return { serverRevision: pathRev };
-        }
-        return null;
-      }
-      case "rename": {
-        const oldPath = normalizePath(change.oldPath ?? "");
-        if (pathRev !== null && pathRev > change.baseRevision && !allowedStale(pathState)) {
-          return { serverRevision: pathRev };
-        }
-        const oldState = this.pathState(oldPath);
-        const oldPathRev = oldState?.last_revision ?? null;
-        if (oldPathRev !== null && oldPathRev > change.baseRevision && !allowedStale(oldState)) {
-          return { serverRevision: oldPathRev };
-        }
-        const collision = this.collisionPath(path);
-        if (collision && collision !== oldPath && collision !== path) return { serverRevision: this.pathRevision(collision) ?? 0 };
-        return null;
-      }
-      default:
-        throw new ApiError("BAD_REQUEST", `unknown operation: ${change.operation}`);
-    }
-  }
-
   private commit(change: Change, path: string): number {
     const state = this.stateRow();
     const revision = state.current_revision + 1;
@@ -661,55 +593,12 @@ export class VaultSyncDO extends DurableObject<Env> {
     }
   }
 
-  private commitCopy(conflictPath: string, original: Change): number {
-    const copy: Change = {
-      operationId: `cnf_${original.operationId}`,
-      revision: 0,
-      deviceId: original.deviceId,
-      path: conflictPath,
-      operation: "create",
-      baseRevision: original.baseRevision,
-      timestamp: original.timestamp || Date.now(),
-      payload: original.payload,
-      // Chunked content must be preserved: completeUpload materialises the
-      // uploaded bytes under the copy revision (via the receipt), so the row
-      // has to carry the same descriptor for devices to download it.
-      content: original.content,
-    };
-    const revision = this.commit(copy, conflictPath);
-    this.ctx.storage.sql.exec(
-      "INSERT OR REPLACE INTO operation_receipts (operation_id, revision) VALUES (?, ?)",
-      original.operationId,
-      revision,
-    );
-    return revision;
-  }
-
   private getChangeByRevision(revision: number): ChangeRow | null {
     return (
       this.ctx.storage.sql
         .exec<ChangeRow>("SELECT * FROM changes WHERE revision = ?", revision)
         .one() ?? null
     );
-  }
-
-  private freshConflictPath(path: string, change: Change): string {
-    const slash = path.lastIndexOf("/");
-    const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
-    const name = slash >= 0 ? path.slice(slash + 1) : path;
-    const dot = name.lastIndexOf(".");
-    const stem = dot > 0 ? name.slice(0, dot) : name;
-    const ext = dot > 0 ? name.slice(dot) : "";
-    const stamp = new Date(change.timestamp || Date.now())
-      .toISOString()
-      .replace(/[-:T]/g, "")
-      .slice(0, 12);
-    for (let i = 0; i < 100; i++) {
-      const suffix = i === 0 ? "" : `-${i}`;
-      const candidate = `${dir}${stem} (conflict-${change.deviceId}-${stamp})${suffix}${ext}`;
-      if (this.pathRevision(candidate) === null) return candidate;
-    }
-    throw new ApiError("CONFLICT", "could not allocate conflict path");
   }
 
   private getReceipt(operationId: string): number | null {
@@ -719,22 +608,10 @@ export class VaultSyncDO extends DurableObject<Env> {
     return row?.revision ?? null;
   }
 
-  private pathRevision(path: string): number | null {
-    return this.pathState(path)?.last_revision ?? null;
-  }
-
   private pathState(path: string): PathState | null {
     return this.ctx.storage.sql
       .exec<PathState>("SELECT last_revision, deleted, content_hash, last_operation_id FROM path_state WHERE path = ?", path)
       .toArray()[0] ?? null;
-  }
-
-  private collisionPath(path: string): string | null {
-    const key = pathCollisionKey(path);
-    const row = this.ctx.storage.sql
-      .exec<{ path: string }>("SELECT path FROM path_state WHERE collision_key = ? AND deleted = 0 LIMIT 1", key)
-      .toArray()[0];
-    return row?.path ?? null;
   }
 
   private setPathState(path: string, revision: number, deleted: boolean, contentHash?: string, operationId?: string): void {

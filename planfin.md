@@ -1,5 +1,10 @@
 Build an MVP called SyncVault: an Obsidian plugin that synchronizes an Obsidian vault between desktop and mobile.
 
+> **Current policy supersession:** conflict-preservation requirements in this
+> historical MVP plan are superseded by `conflict-removal-plan.md`. Valid
+> mutations now target server-revision last-write-wins. Existing conflict-named
+> files remain untouched, and new conflict files must not be created.
+
 IMPORTANT:
 Do not overengineer this.
 
@@ -399,10 +404,14 @@ When network returns:
 The user should never lose a local edit merely because the server is unavailable.
 
 ==================================================
-CONFLICT DETECTION
+HISTORICAL CONFLICT DETECTION (SUPERSEDED)
 ==================================================
 
-Use baseRevision.
+The original conflict-preservation design below is retained as historical
+context only. The current plan is `conflict-removal-plan.md`: valid mutations
+are committed in server order, later revisions replace earlier content, and
+new conflict files are never created. Existing conflict-named files remain
+untouched.
 
 Example:
 
@@ -634,8 +643,9 @@ Test exactly this:
 11. Mobile modifies test.md.
 12. Turn Desktop network on.
 13. Desktop catches up.
-14. Make conflicting edits on both devices.
-15. Verify conflict is detected and neither version is silently lost.
+14. Make edits on both devices while offline.
+15. Verify writes are committed in server order and both devices converge to
+    the latest server revision without creating a new conflict file.
 
 Do not move to advanced features until this works.
 
@@ -701,7 +711,7 @@ PHASE 9:
 Offline catch-up.
 
 PHASE 10:
-Revision-based conflict detection.
+Server-revision last-write-wins; no new conflict-file generation.
 
 PHASE 11:
 Temporary change cleanup.

@@ -144,7 +144,7 @@ describe("vaults and devices", () => {
 });
 
 describe("vault sync core", () => {
-  it("serializes mutations, detects conflicts, keeps operation receipts", async () => {
+  it("serializes mutations, keeps operation receipts, accepts stale writes (last-write-wins)", async () => {
     await createAccount("carol");
     const vaultId = await createVault("carol", "DSA");
     const stub = env.VAULT_DO.getByName(vaultId);
@@ -171,31 +171,27 @@ describe("vault sync core", () => {
     );
     expect(updated).toEqual({ status: "accepted", revision: 2 });
 
-    // stale update (base 1 but path is at revision 2) -> conflict, copy committed
-    const conflicted = await stub.submitChange(
+    // stale update (base 1 but path is at revision 2): accepted anyway —
+    // last-write-wins; the incoming commit overwrites the path at revision 3.
+    const stale = await stub.submitChange(
       change({ operationId: "op-3", path: "a.md", operation: "update", baseRevision: 1, payload: "c3RhbGU=", deviceId }),
       deviceId,
     );
-    expect(conflicted.status).toBe("conflict");
-    if (conflicted.status !== "conflict") throw new Error("expected conflict");
-    expect(conflicted.serverRevision).toBe(2);
-    expect(conflicted.conflictPath).toContain("a (conflict-");
-    const conflictPath = conflicted.conflictPath as string;
-    expect(conflictPath.endsWith(".md")).toBe(true);
+    expect(stale).toEqual({ status: "accepted", revision: 3 });
 
-    // retry of the conflicted operation resolves via receipt -> accepted
+    // retry of the stale operation resolves via receipt -> accepted, same revision
     const retried = await stub.submitChange(
       change({ operationId: "op-3", path: "a.md", operation: "update", baseRevision: 1, payload: "c3RhbGU=", deviceId }),
       deviceId,
     );
-    expect(retried.status).toBe("accepted");
+    expect(retried).toEqual({ status: "accepted", revision: 3 });
 
-    // change log reflects only the committed mutations
+    // change log reflects only the committed mutations — no conflict copies
     const log = await stub.changesAfter(0);
     expect(log.map((c) => `${c.revision}:${c.path}`)).toEqual([
       "1:a.md",
       "2:a.md",
-      `3:${conflictPath}`,
+      "3:a.md",
     ]);
 
     // malicious payload too large

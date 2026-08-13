@@ -13,7 +13,6 @@ const STATUS_LABELS: Record<SyncStatus, string> = {
   syncing: "↻ Syncing",
   downloading: "↓ Downloading",
   uploading: "↑ Uploading",
-  conflict: "⚠ Conflict",
   offline: "✕ Offline",
   synced: "✓ Synced",
   paused: "⏸ Paused",
@@ -124,7 +123,6 @@ export class SyncVaultSettingsTab extends PluginSettingTab {
                 this.display();
               },
               () => this.engine.resetForRebuild(),
-              () => this.engine.enterJoinMode(),
               () => this.engine.countSyncableFiles(),
             ).open();
           }),
@@ -132,7 +130,7 @@ export class SyncVaultSettingsTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Recover sync — join rebuilt baseline")
-      .setDesc("Download the rebuilt baseline to this device. Local files that differ are kept as conflict copies, not deleted.")
+      .setDesc("Download the rebuilt baseline to this device. Local files are overwritten by the baseline; no conflict copies are created.")
       .addButton((b) =>
         b
           .setButtonText("Pull rebuilt baseline")
@@ -148,7 +146,6 @@ export class SyncVaultSettingsTab extends PluginSettingTab {
                 this.display();
               },
               () => this.engine.resetForRebuild(),
-              () => this.engine.enterJoinMode(),
               () => this.engine.countSyncableFiles(),
             ).open();
           }),

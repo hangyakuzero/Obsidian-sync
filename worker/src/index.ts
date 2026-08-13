@@ -143,15 +143,7 @@ async function route(request: Request, env: Env): Promise<Response> {
         const result = await rpc(env.VAULT_DO.getByName(rest[0]).submitChange(change, auth.deviceId, {
           strict: capabilities.includes(CHUNK_CAPABILITY),
         }));
-        if (result.status === "accepted") {
-          return Response.json({ status: "accepted", revision: result.revision });
-        }
-        return Response.json({
-          status: "conflict",
-          path: result.path,
-          conflictPath: result.conflictPath,
-          serverRevision: result.serverRevision,
-        });
+        return Response.json({ status: "accepted", revision: result.revision });
       }
       if (rest.length === 2 && rest[1] === "uploads" && request.method === "POST") {
         const auth = bearer(request);
@@ -282,7 +274,6 @@ const DO_ERROR_CODES: [prefix: string, code: string][] = [
   ["uploaded file has the wrong length", "UPLOAD_INCOMPLETE"],
   ["invalid acknowledgement revision", "BAD_REQUEST"],
   ["this vault contains chunked content; update SyncVault", "CLIENT_UPGRADE_REQUIRED"],
-  ["could not allocate conflict path", "CONFLICT"],
 ];
 
 async function rpc<T>(promise: Promise<T>): Promise<T> {

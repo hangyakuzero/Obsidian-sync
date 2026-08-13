@@ -70,7 +70,6 @@ describe("HttpConnection", () => {
     let accepted: { operationId: string; revision: number } | null = null;
     const conn = new HttpConnection(makeState(), makeClient(), {
       onAccepted: (operationId, revision) => (accepted = { operationId, revision }),
-      onConflict: () => undefined,
       onError: () => undefined,
     } as ConnectionCallbacks);
     conn.sendChange(change());
@@ -78,18 +77,17 @@ describe("HttpConnection", () => {
     expect(accepted).toEqual({ operationId: "op-1", revision: 9 });
   });
 
-  it("resolves conflict via the onConflict callback", async () => {
-    let conflict: { operationId: string; conflictPath?: string } | null = null;
-    const client = makeClient({
-      pushChange: async () => ({ status: "conflict" as const, path: "a.md", conflictPath: "a (conflict).md", serverRevision: 9 }),
-    });
-    const conn = new HttpConnection(makeState(), client, {
-      onConflict: (c) => (conflict = { operationId: c.operationId, conflictPath: c.conflictPath }),
+  it("accepts a push with a stale base revision (last-write-wins)", async () => {
+    let accepted: { operationId: string; revision: number } | null = null;
+    const conn = new HttpConnection(makeState(), makeClient(), {
+      onAccepted: (operationId, revision) => (accepted = { operationId, revision }),
       onError: () => undefined,
     } as ConnectionCallbacks);
-    conn.sendChange(change());
+    // A client that fell behind the server still gets its upload accepted;
+    // there is no conflict response to fall back on.
+    conn.sendChange(change({ baseRevision: 2 }));
     await new Promise((r) => setTimeout(r, 20));
-    expect(conflict).toEqual({ operationId: "op-1", conflictPath: "a (conflict).md" });
+    expect(accepted).toEqual({ operationId: "op-1", revision: 9 });
   });
 
   it("reports push failures on the error callback", async () => {
@@ -165,12 +163,11 @@ describe("HttpConnection", () => {
     });
     const conn = new HttpConnection(makeState(), client, {
       onAuthed: () => (authed += 1),
-      onConflict: () => undefined,
     } as ConnectionCallbacks);
     await conn.pull(5);
     conn.sendChange(change());
     await new Promise((r) => setTimeout(r, 20));
-    // pull + push accept = 2 authenticated successes (conflict would also count)
+    // pull + push accept = 2 authenticated successes
     expect(authed).toBe(2);
   });
 

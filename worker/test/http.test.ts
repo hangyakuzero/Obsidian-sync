@@ -156,7 +156,7 @@ describe("HTTP sync endpoints", () => {
     expect(((await foreign.json()) as { error: string }).error).toBe("CONFLICT");
   });
 
-  it("push reports conflicts over HTTP and idempotent retries resolve", async () => {
+  it("accepts stale pushes over HTTP (last-write-wins) and resolves retries idempotently", async () => {
     const t = await setup("httpt4");
     const vault = env.VAULT_DO.getByName(t.vaultId);
 
@@ -167,7 +167,7 @@ describe("HTTP sync endpoints", () => {
     });
     expect((await push1.json())).toEqual({ status: "accepted", revision: 1 });
 
-    // stale push (base 0, path at 1) -> conflict
+    // stale push (base 0, path at 1) is accepted — no conflict copy is made
     const push2 = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/changes`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: auth(t) },
@@ -175,9 +175,7 @@ describe("HTTP sync endpoints", () => {
         change({ operationId: "op-b", deviceId: t.deviceId, path: "a.md", operation: "update", baseRevision: 0 }),
       ),
     });
-    const conflict = (await push2.json()) as { status: string; conflictPath?: string };
-    expect(conflict.status).toBe("conflict");
-    expect(conflict.conflictPath).toContain("a (conflict-");
+    expect((await push2.json())).toEqual({ status: "accepted", revision: 2 });
 
     // retry of the same operation resolves idempotently
     const retry = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/changes`, {
@@ -190,7 +188,7 @@ describe("HTTP sync endpoints", () => {
     expect((await retry.json())).toEqual({ status: "accepted", revision: 2 });
 
     const log = await vault.changesAfter(0);
-    expect(log.map((c) => c.operation)).toEqual(["create", "create"]);
+    expect(log.map((c) => c.operation)).toEqual(["create", "update"]);
   });
 
   it("rejects payload-less creates and supports authenticated vault reset", async () => {

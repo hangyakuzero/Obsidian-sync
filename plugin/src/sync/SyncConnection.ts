@@ -37,7 +37,6 @@ export interface ConnectionCallbacks {
   onWelcome(serverRevision: number, resyncRequired: boolean): void;
   onRemoteChange(change: Change): void | Promise<void>;
   onAccepted(operationId: string, revision: number): void;
-  onConflict(opts: { operationId: string; path: string; conflictPath?: string; serverRevision: number }): void;
   onRejected?(operationId: string, code: string, message: string): void;
   onAuthFailure?(message: string): void;
   /** Any authenticated success (HTTP pull/push or WS welcome) resets the
@@ -177,13 +176,6 @@ export class SyncConnection implements Connection {
         // Announcement still travels over the socket so the broadcast order
         // stays intact; the accepted reply will resolve the pending ack.
         this.send({ type: "change", change: { ...change, deviceId: p.deviceId } });
-      } else {
-        this.callbacks.onConflict({
-          operationId: change.operationId,
-          path: result.path,
-          conflictPath: result.conflictPath,
-          serverRevision: result.serverRevision,
-        });
       }
     } catch (e) {
       this.callbacks.onRetry?.(change.operationId, (e as Error).message);
@@ -243,16 +235,6 @@ export class SyncConnection implements Connection {
         // Serialized behind every preceding remote application so the push
         // cursor optimization can never skip a revision the server broadcast.
         this.chain(() => this.callbacks.onAccepted(msg.operationId, msg.revision));
-        break;
-      case "conflict":
-        this.chain(() =>
-          this.callbacks.onConflict({
-            operationId: msg.operationId,
-            path: msg.path,
-            conflictPath: msg.conflictPath,
-            serverRevision: msg.serverRevision,
-          }),
-        );
         break;
       case "error":
         this.callbacks.onError(msg.message);

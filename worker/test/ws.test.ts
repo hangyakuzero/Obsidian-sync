@@ -158,7 +158,7 @@ describe("websocket sync", () => {
     expect(status.currentRevision).toBe(1);
   });
 
-  it("rejects a bad token and catches a stale write as a conflict copy", async () => {
+  it("rejects a bad token and accepts a stale write (last-write-wins)", async () => {
     const t = await setup("wstest2");
     // bad token -> closed with 4401
     const wsBad = await openWs(t.accountId, t.vaultId, t.deviceA, 0);
@@ -183,23 +183,22 @@ describe("websocket sync", () => {
     wsA.send(changeMsg(t.deviceA, { path: "A.md", operation: "create", payload: toBase64(new TextEncoder().encode("v1")) }));
     await acceptedA;
 
-    // B edits A.md based on revision 0 (stale) -> conflict + conflict copy broadcast
-    const conflictP = nextMessage(wsB, (m) => m.type === "conflict");
-    const copyP = nextMessage(wsB, (m) => m.type === "change");
+    // B edits A.md based on revision 0 (stale) -> accepted, overwrites A.md.
+    // Register A's broadcast watcher first: the overwrite is broadcast during
+    // submit, before B's accepted reply arrives.
+    const changeOnA = nextMessage(wsA, (m) => m.type === "change");
+    const acceptedB = nextMessage(wsB, (m) => m.type === "accepted");
     wsB.send(changeMsg(t.deviceB, { path: "A.md", operation: "update", baseRevision: 0, payload: toBase64(new TextEncoder().encode("v2B")) }));
-    const conflict = (await conflictP) as Extract<ServerMessage, { type: "conflict" }>;
-    expect(conflict.path).toBe("A.md");
-    expect(conflict.conflictPath).toContain("A (conflict-");
+    const accepted = (await acceptedB) as Extract<ServerMessage, { type: "accepted" }>;
+    expect(accepted.revision).toBe(2);
+    const received = (await changeOnA) as { type: "change"; change: Change };
+    expect(received.change.path).toBe("A.md");
+    expect(received.change.payload).toBe(toBase64(new TextEncoder().encode("v2B")));
 
-    // Device B also receives its own conflict copy as a change (broadcast to all)
-    const copy = (await copyP) as { type: "change"; change: Change };
-    expect(copy.change.path).toContain("conflict");
-    expect(copy.change.operation).toBe("create");
-    expect(copy.change.payload).toBe(toBase64(new TextEncoder().encode("v2B")));
-
-    // Server state: A.md canonical (rev 1), conflict copy (rev 2)
+    // Server state: A.md canonical at rev 2, no conflict copies anywhere
     const log = await env.VAULT_DO.getByName(t.vaultId).changesAfter(0);
-    expect(log.map((c) => `${c.revision}:${c.path}`)).toEqual(["1:A.md", `2:${conflict.conflictPath}`]);
+    expect(log.map((c) => `${c.revision}:${c.path}`)).toEqual(["1:A.md", "2:A.md"]);
+    expect(log.some((c) => c.path.includes("conflict"))).toBe(false);
   });
 
   it("catch-up replays changes after the client's last revision", async () => {

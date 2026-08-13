@@ -158,22 +158,19 @@ describe("SyncEngine", () => {
     expect(rig.state.lastRevision).toBe(4);
   });
 
-  it("removes a queued change when the server reports a conflict", async () => {
+  it("accepts a queued change with a stale base revision (last-write-wins)", async () => {
     const rig = makeRig();
     await rig.queue.enqueue(
       change({ operationId: "op-1", path: "a.md", operation: "update", baseRevision: 3, payload: toBase64(new TextEncoder().encode("local")) }),
     );
     const synced = rig.engine.syncNow();
     await new Promise((r) => setTimeout(r, 10));
-    rig.conn.handlers.onConflict({
-      operationId: "op-1",
-      path: "a.md",
-      conflictPath: "a (conflict-dev-0001-20260812123000).md",
-      serverRevision: 4,
-    });
+    // The server no longer rejects stale uploads with a conflict copy; the
+    // push is accepted and the cursor advances to the server revision.
+    rig.conn.handlers.onAccepted("op-1", 4);
     await synced;
     expect(rig.queue.size()).toBe(0);
-    expect(rig.state.lastRevision).toBe(3);
+    expect(rig.state.lastRevision).toBe(4);
   });
 
   it("keeps the queued change when the connection drops mid-flush", async () => {
@@ -331,7 +328,7 @@ describe("SyncEngine", () => {
     // the first failure retries instead of destroying sync
     rig.conn.handlers.onRemoteChange(remote);
     await new Promise((r) => setTimeout(r, 10));
-    expect(rig.engine.status).toBe("conflict");
+    expect(rig.engine.status).toBe("syncing");
     expect(rig.engine.isPaused).toBe(false);
     // never ACK an unapplied change
     expect(rig.state.lastRevision).toBe(3);
@@ -604,7 +601,7 @@ describe("SyncEngine", () => {
     // a single fetch failure is retried, not fatal
     rig.conn.handlers.onRemoteChange(remote);
     await new Promise((r) => setTimeout(r, 10));
-    expect(rig.engine.status).toBe("conflict");
+    expect(rig.engine.status).toBe("syncing");
     expect(rig.engine.isPaused).toBe(false);
     // repeated failures pause once
     for (let i = 0; i < 2; i++) {
@@ -640,7 +637,7 @@ describe("SyncEngine", () => {
     expect(rig.state.lastRevision).toBe(4);
   });
 
-  it("enters conflict status and keeps the queue when the server demands a resync", async () => {
+  it("enters paused status and keeps the queue when the server demands a resync", async () => {
     const rig = makeRig();
     await rig.queue.enqueue(change({ operationId: "op-1", path: "a.md" }));
     (rig.conn as unknown as FakeConnection & { pullOverride?: unknown }).pull = async () => ({
@@ -651,11 +648,11 @@ describe("SyncEngine", () => {
     const synced = rig.engine.syncNow();
     await new Promise((r) => setTimeout(r, 10));
     await synced;
-    expect(rig.engine.status).toBe("conflict");
+    expect(rig.engine.status).toBe("paused");
     expect(rig.queue.size()).toBe(1);
   });
 
-  it("wires onResyncRequired from the transport into the same conflict state", async () => {
+  it("wires onResyncRequired from the transport into the paused state", async () => {
     const rig = makeRig();
     await rig.queue.enqueue(change({ operationId: "op-1", path: "a.md" }));
     const synced = rig.engine.syncNow();
@@ -663,7 +660,7 @@ describe("SyncEngine", () => {
     rig.conn.handlers.onResyncRequired?.("retention window exceeded");
     await new Promise((r) => setTimeout(r, 10));
     await synced;
-    expect(rig.engine.status).toBe("conflict");
+    expect(rig.engine.status).toBe("paused");
     expect(rig.queue.size()).toBe(1);
   });
 
@@ -722,7 +719,7 @@ describe("SyncEngine", () => {
     // a single ambiguous rename retries instead of killing sync
     rig.conn.handlers.onRemoteChange(remote);
     await new Promise((r) => setTimeout(r, 10));
-    expect(rig.engine.status).toBe("conflict");
+    expect(rig.engine.status).toBe("syncing");
     expect(rig.engine.isPaused).toBe(false);
     // repeated failures pause once, never ACKing
     for (let i = 0; i < 2; i++) {
@@ -735,7 +732,7 @@ describe("SyncEngine", () => {
     expect(rig.state.lastRevision).toBe(3);
   });
 
-  it("preserves an occupied rename target as a queued conflict copy", async () => {
+  it("removes an occupied rename target (last-write-wins) instead of preserving it", async () => {
     const rig = makeRig();
     rig.files.set("src.md", new Uint8Array(new TextEncoder().encode("src").buffer as ArrayBuffer));
     rig.files.set("dst.md", new Uint8Array(new TextEncoder().encode("local dst").buffer as ArrayBuffer));
@@ -748,15 +745,11 @@ describe("SyncEngine", () => {
     });
     rig.conn.handlers.onRemoteChange(remote);
     await new Promise((r) => setTimeout(r, 10));
-    expect(rig.renames.length).toBe(2);
-    expect(rig.renames[0].oldPath).toBe("dst.md");
-    expect(rig.renames[0].newPath).toMatch(/dst \(conflict-local-\d+\)\.md/);
-    expect(rig.renames[1]).toEqual({ oldPath: "src.md", newPath: "dst.md" });
-    // the preserved copy is queued for upload with its content descriptor
-    expect(rig.queue.size()).toBe(1);
-    const copy = rig.queue.items[0];
-    expect(copy.path).toMatch(/dst \(conflict-local-\d+\)\.md/);
-    expect(copy.operation).toBe("create");
+    // the occupied destination is deleted, then the rename applies cleanly
+    expect(rig.removes).toEqual(["dst.md"]);
+    expect(rig.renames).toEqual([{ oldPath: "src.md", newPath: "dst.md" }]);
+    // no conflict copy is created or queued
+    expect(rig.queue.size()).toBe(0);
     expect(rig.conn.acks).toEqual([7]);
   });
 
@@ -779,7 +772,7 @@ describe("SyncEngine", () => {
     expect(rig.conn.acks).toEqual([8]);
   });
 
-  it("backs a file up and queues it when a folder is needed in its place", async () => {
+  it("removes a file blocking a remote folder path (last-write-wins)", async () => {
     const rig = makeRig();
     rig.files.set("dir", new Uint8Array(new TextEncoder().encode("oops").buffer as ArrayBuffer));
     const remote = change({
@@ -791,13 +784,12 @@ describe("SyncEngine", () => {
     });
     rig.conn.handlers.onRemoteChange(remote);
     await new Promise((r) => setTimeout(r, 10));
-    expect(rig.renames.length).toBe(1);
-    expect(rig.renames[0].oldPath).toBe("dir");
-    expect(rig.renames[0].newPath).toMatch(/dir \(conflict-local-\d+\)/);
+    // the blocking file is deleted, then the nested write lands
+    expect(rig.removes).toEqual(["dir"]);
     expect(rig.writes.length).toBe(1);
     expect(rig.writes[0].path).toBe("dir/note.md");
-    const copy = rig.queue.items.find((c) => c.path.includes("conflict-local"))!;
-    expect(copy.operation).toBe("create");
+    // no backup copy is queued for upload
+    expect(rig.queue.size()).toBe(0);
     expect(rig.conn.acks).toEqual([9]);
   });
 
@@ -909,9 +901,9 @@ describe("SyncEngine", () => {
     });
     rig.conn.handlers.onRemoteChange(remote);
     await new Promise((r) => setTimeout(r, 10));
-    // first attempt fails: sync stays live (conflict status), cursor untouched
+    // first attempt fails: sync stays live (syncing status), cursor untouched
     expect(rig.writes.length).toBe(0);
-    expect(rig.engine.status).toBe("conflict");
+    expect(rig.engine.status).toBe("syncing");
     expect(rig.engine.isPaused).toBe(false);
     expect(rig.state.lastRevision).toBe(3);
     // the change is redelivered on the next pull and now succeeds
@@ -1029,53 +1021,6 @@ describe("SyncEngine", () => {
     expect(empty.payload).toBe("");
   });
 
-  it("join mode preserves divergent local files as conflict copies", async () => {
-    const rig = makeRig();
-    rig.engine.enterJoinMode();
-    const local = new TextEncoder().encode("local edit");
-    const remoteBytes = new TextEncoder().encode("remote baseline");
-    rig.files.set("kept.md", new Uint8Array(local.buffer as ArrayBuffer));
-    const remote: Change = change({
-      operationId: "join-op",
-      revision: 7,
-      path: "kept.md",
-      operation: "update",
-      baseRevision: 0,
-      payload: toBase64(remoteBytes),
-    });
-    rig.conn.handlers.onRemoteChange(remote);
-    await new Promise((r) => setTimeout(r, 10));
-    // target overwritten with the baseline
-    const target = rig.writes.find((w) => w.path === "kept.md")!;
-    expect(new TextDecoder().decode(target.bytes)).toBe("remote baseline");
-    // local bytes preserved under a conflict copy, queued for upload
-    const backup = rig.writes.find((w) => w.path !== "kept.md")!;
-    expect(backup.path).toMatch(/^kept \(conflict-local-\d{12}\)\.md$/);
-    expect(new TextDecoder().decode(backup.bytes)).toBe("local edit");
-    expect(rig.queue.items.some((c) => c.path === backup.path)).toBe(true);
-    expect(rig.conn.acks).toEqual([7]);
-  });
-
-  it("join mode leaves identical local files untouched", async () => {
-    const rig = makeRig();
-    rig.engine.enterJoinMode();
-    const bytes = new TextEncoder().encode("# same");
-    rig.files.set("same.md", new Uint8Array(bytes.buffer as ArrayBuffer));
-    const remote: Change = change({
-      operationId: "join-2",
-      revision: 7,
-      path: "same.md",
-      operation: "update",
-      baseRevision: 0,
-      payload: toBase64(bytes),
-    });
-    rig.conn.handlers.onRemoteChange(remote);
-    await new Promise((r) => setTimeout(r, 10));
-    expect(rig.writes.length).toBe(1);
-    expect(rig.writes[0].path).toBe("same.md");
-    expect(rig.queue.size()).toBe(0);
-  });
-
   it("counts syncable files for recovery safety checks", async () => {
     const rig = makeRig({
       scanner: {
@@ -1164,7 +1109,7 @@ class FakeServer {
   private revision = 1;
   private receipts = new Map<string, number>();
 
-  submit(c: Change, deviceId: string): { status: "accepted"; revision: number } | { status: "conflict"; serverRevision: number } {
+  submit(c: Change, deviceId: string): { status: "accepted"; revision: number } {
     const receipt = this.receipts.get(c.operationId);
     if (receipt !== undefined) return { status: "accepted", revision: receipt };
     const rev = this.revision++;
@@ -1201,15 +1146,7 @@ class FakeServerConnection implements Connection {
 
   sendChange(c: Change): boolean {
     const result = this.server.submit(c, this.deviceId);
-    if (result.status === "accepted") {
-      this.handlers.onAccepted(c.operationId, result.revision);
-    } else {
-      this.handlers.onConflict({
-        operationId: c.operationId,
-        path: c.path,
-        serverRevision: result.serverRevision,
-      });
-    }
+    this.handlers.onAccepted(c.operationId, result.revision);
     return true;
   }
 

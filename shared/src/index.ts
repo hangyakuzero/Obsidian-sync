@@ -48,7 +48,6 @@ export type ServerMessage =
   | { type: "welcome"; serverRevision: number; resyncRequired: boolean }
   | { type: "change"; change: Change }
   | { type: "accepted"; operationId: string; revision: number }
-  | { type: "conflict"; operationId: string; path: string; conflictPath?: string; serverRevision: number }
   | { type: "error"; code: string; message: string }
   | { type: "batch"; items: ServerMessage[] };
 

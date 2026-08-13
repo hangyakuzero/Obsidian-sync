@@ -185,7 +185,7 @@ describe("chunked uploads", () => {
     expect(((await incomplete.json()) as { error: string }).error).toBe("UPLOAD_INCOMPLETE");
   });
 
-  it("keeps a chunked conflict copy downloadable with its content reference", async () => {
+  it("accepts a chunked upload with a stale base revision (last-write-wins)", async () => {
     const t = await setup("upt3");
     const vault = env.VAULT_DO.getByName(t.vaultId);
 
@@ -201,7 +201,8 @@ describe("chunked uploads", () => {
     });
     expect(base.status).toBe(200);
 
-    // Chunked update based on revision 0 (stale) => conflict copy.
+    // Chunked update based on revision 0 (stale): accepted at the head of the
+    // log; the stale commit overwrites a.md — no conflict copy is made.
     const bytes = new TextEncoder().encode("stale divergent bytes");
     const content: ContentReference = {
       hash: await sha256Hex(bytes),
@@ -223,19 +224,18 @@ describe("chunked uploads", () => {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: auth(t) },
     });
-    const conflict = (await done.json()) as { status: string; conflictPath?: string; serverRevision: number };
-    expect(conflict.status).toBe("conflict");
-    expect(conflict.conflictPath).toContain("a (conflict-");
+    expect((await done.json())).toEqual({ status: "accepted", revision: 2 });
 
-    // The committed copy carries the content ref and its bytes are fetchable.
+    // The committed change carries the content ref and its bytes are fetchable.
     const log = await vault.changesAfter(0);
-    const copy = log.find((c) => c.path?.startsWith("a (conflict-"));
-    expect(copy).toBeDefined();
-    expect(copy!.content).toEqual(content);
-    expect(copy!.payload).toBeUndefined();
-    const copyRev = copy!.revision;
+    const stale = log.find((c) => c.operationId === "op-stale");
+    expect(stale).toBeDefined();
+    expect(stale!.content).toEqual(content);
+    expect(stale!.payload).toBeUndefined();
+    expect(log.some((c) => c.path?.startsWith("a (conflict-"))).toBe(false);
+    const staleRev = stale!.revision;
     const chunkRes = await SELF.fetch(
-      `http://localhost/v1/vaults/${t.vaultId}/revisions/${copyRev}/chunks/0`,
+      `http://localhost/v1/vaults/${t.vaultId}/revisions/${staleRev}/chunks/0`,
       { headers: { Authorization: auth(t) } },
     );
     expect(chunkRes.status).toBe(200);

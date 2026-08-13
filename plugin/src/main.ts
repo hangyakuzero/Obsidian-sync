@@ -32,7 +32,6 @@ const STATUS_ICONS: Record<SyncStatus, string> = {
   syncing: "SyncVault: ↻ Syncing",
   downloading: "SyncVault: ↓ Downloading",
   uploading: "SyncVault: ↑ Uploading",
-  conflict: "SyncVault: ⚠ Conflict",
   offline: "SyncVault: ✕ Offline",
   synced: "SyncVault: ✓ Synced",
   paused: "SyncVault: ⏸ Paused",
@@ -204,8 +203,8 @@ export default class SyncVaultPlugin extends Plugin {
         }
         if (!(await this.app.vault.adapter.exists(oldPath))) return;
         await ensureParentFolders(this.app.vault.adapter, newPath);
-        // Occupied destinations, case-only renames, and conflict copies are
-        // handled by the engine before this point.
+        // Occupied destinations and case-only renames are resolved by the
+        // engine (last-write-wins) before this point; nothing is preserved.
         await this.app.vault.adapter.rename(oldPath, newPath);
       },
     },

@@ -4,7 +4,9 @@ Reported symptoms:
 
 - Sync stops at random times; mobile vault "disconnected on its own" and required logging in again.
 - `destination file already exists` error pops up repeatedly; sync stays paused.
-- The conflict mechanism creates a lot of duplicate `(conflict-…).md` files even when there are 0 real conflicts.
+- The conflict mechanism creates duplicate `(conflict-…).md` files even when
+  there are no user-visible conflicts. The replacement policy is now
+  server-revision last-write-wins; existing copies remain untouched.
 
 ## Root causes
 
@@ -17,8 +19,12 @@ Reported symptoms:
 ### S3. 401 on mobile → forced manual re-login
 Any HTTP 401 in `HttpConnection.pull`/`push` (`plugin/src/sync/HttpConnection.ts:57-60, 95-100`) fires `handleAuthFailure` (`SyncEngine.ts:200-206`): disconnect + clear pending acks + `paused = true`. This happens when the server-side device/token state is gone (worker redeploy with clean DO storage, dev state purge, new subdomain). Nothing ever rotates tokens, and `AccountDO.registerDevice` (`worker/src/durable-objects/AccountDO.ts:169-172`) returns `409 device already registered` for an existing deviceId — so recovery requires the full disconnect→re-setup flow, which then replays history and re-triggers S2. Matches "mobile disconnected on its own and I had to log in again".
 
-### S4. Server commits conflict copies even for identical content
-`VaultSyncDO.detectConflict` (`worker/src/durable-objects/VaultSyncDO.ts:352-385`) compares only `pathRev > baseRevision`, never the payload. Re-uploads of the *same bytes* (seed races, reconnect echoes, S1 cascades) are treated as conflicts: `commitCopy` (`VaultSyncDO.ts:437-455`) writes a new `create` for `x (conflict-…).md` as a new revision, which then materializes on **every** device via the next pull. "A lot of duplicate files even when there are 0 conflicts".
+### S4. Server conflict detection manufactures duplicate files
+`VaultSyncDO.detectConflict` compares `pathRev > baseRevision` and creates a
+new `create` under `x (conflict-…).md`. Re-uploads, stale writes, and ordinary
+offline edits can therefore materialize duplicate files on every device. The
+replacement is to remove conflict detection entirely and commit valid writes
+in server revision order.
 
 ### S5. Remote-apply failure policy pauses on any benign race
 The pause-on-error in `applyRemoteChange` is too broad. Already-applied changes (source gone, dest present), occupied rename targets, and folder/file collisions are all benign races that should not stop sync.
@@ -46,7 +52,7 @@ A device behind the retained history can push but never pull; no recovery except
 - `VaultOps.rename` (`main.ts`):
   - Source missing + destination exists → already-applied → skip silently (no throw, no pause).
   - Source missing + destination missing → notify once, skip.
-  - Source and destination both exist (occupied destination) → back up the existing destination bytes to a fresh `(conflict-…).md` copy first, then rename (per plan §5 "preserve the existing destination"). **Default: back-up-then-rename.**
+  - Source and destination both exist (occupied destination) → remove the destination, then apply the incoming rename. **Default: latest incoming revision wins.**
 - `SyncEngine.applyRemoteChange`: benign cases (skipped/backed-up applies) → ACK + advance cursor, no pause; pause only for fatal local errors (disk full, invalid payload).
 - `SyncState.disconnect()`: preserve `lastRevision`/`seeded`/`appliedPaths` on a plain disconnect; only the Rebuild/Join flows reset the cursor. A re-login via token rotation (F3) then keeps the device cursor → no full history replay → the S2 loop cannot re-trigger.
 
@@ -55,8 +61,16 @@ A device behind the retained history can push but never pull; no recovery except
 - Plugin `AuthManager.existingUser`: re-registration via the existing flow now rotates the token; add a Settings "Reconnect vault" button that runs password-only re-registration without resetting state.
 - `handleAuthFailure`: pause only after 3 consecutive 401s (not the first), rate-limit the notice so a broken server-side state does not hammer or spam.
 
-### F4 — Identical-content dedupe on the server (S4)
-- In `VaultSyncDO.submitChange` / `detectConflict`: when an upsert "conflicts" by revision, fetch the change at `pathRev` (`getChangeByRevision`); if it is a create/update with the **same payload**, treat it as accepted — record the receipt, return `{status: "accepted"}`, commit **no** new revision and **no** conflict copy. Different content → existing conflict-copy behavior unchanged.
+### F4 — Remove conflict generation and use last-write-wins (S4)
+- In `VaultSyncDO.submitChange` and `completeUpload`, remove conflict
+  detection, conflict-copy commits, and collision-path allocation.
+- Commit every valid mutation, regardless of `baseRevision`, and return the
+  committed revision as `accepted`.
+- Remove conflict result types and plugin conflict callbacks.
+- Replace occupied-destination and file/folder backup copies with destructive
+  latest-incoming application on the receiving device.
+- Keep existing conflict-named files untouched; this change does not clean up
+  historical files.
 
 ### F5 — Timeouts on all HTTP calls (S6)
 - `SyncClient.request` passes `timeout` to Obsidian's `requestUrl` (supported option). Timeouts and non-2xx both raise; `pollOnce`'s `finally` then clears `polling` and cannot deadlock.
@@ -84,11 +98,11 @@ A device behind the retained history can push but never pull; no recovery except
 
 - **Worker** (`mutations.test.ts` / `core.test.ts`):
   - Re-registering an existing device for the same vault rotates the token; old token rejected, new token works.
-  - Stale upsert with identical payload → `accepted`, no conflict copy, log size unchanged.
-  - Stale upsert with different payload → conflict + copy (existing tests stay green).
+  - Stale upsert with identical payload → `accepted`, no copy.
+  - Stale upsert with different payload → `accepted`, latest revision wins, no copy.
 - **Plugin** (`SyncEngine.test.ts`):
   - HTTP push-accept does not advance the cursor past interleaved remote revisions; converge loop applies them (multi-batch).
-  - Rename onto an occupied destination → destination backed up, rename applied, sync not paused.
+  - Rename onto an occupied destination → destination removed, rename applied, sync not paused.
   - Already-applied rename (source gone, dest present) → no pause, cursor advances.
   - `advanceCursorOnAccept` honored per transport.
 - **Watcher** (`VaultWatcher.test.ts`): suppression expires after the short TTL.

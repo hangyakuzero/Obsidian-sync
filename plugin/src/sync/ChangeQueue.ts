@@ -112,9 +112,8 @@ export class ChangeQueue {
   }
 
   /**
-   * Removes an op that was never committed (rejected or rewritten as a
-   * conflict copy) and scrubs its id from the causal parents of survivors so
-   * they do not fail the server's allowedStale check.
+   * Removes an op that was never committed (permanently rejected) and scrubs
+   * its id from the causal parents of survivors.
    */
   async removeDropped(operationId: string): Promise<void> {
     const pending = this.state.pendingChanges;

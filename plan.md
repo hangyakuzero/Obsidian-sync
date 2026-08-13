@@ -1,5 +1,10 @@
 # Build: Obsidian Sync
 
+> **Current policy supersession:** conflict-preservation requirements in this
+> historical build plan are superseded by `conflict-removal-plan.md`. The
+> implementation target is server-revision last-write-wins. Existing
+> `conflict-*` files remain untouched; no new conflict files may be created.
+
 Build a production-oriented Obsidian synchronization service that synchronizes an Obsidian vault between desktop and mobile.
 
 The project must be designed around an always-online cloud backend.
@@ -390,7 +395,13 @@ Return:
 
 ---
 
-# 11. Conflict policy
+# 11. Historical conflict policy (superseded)
+
+The original conflict-preservation policy below is retained as project history
+only. It is not the current implementation target. The active policy is
+documented in `conflict-removal-plan.md`: valid mutations use server-revision
+last-write-wins, existing conflict-named files remain untouched, and no new
+conflict files are created.
 
 V1 must NOT attempt automatic Markdown merging.
 

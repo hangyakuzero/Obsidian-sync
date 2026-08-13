@@ -16,9 +16,10 @@ export interface RecoverContext {
  *
  * - Reset baseline from this device: wipes server history after a local safety
  *   check (this device must actually hold syncable files to seed).
- * - Pull the rebuilt baseline: downloads the new baseline without seeding this
- *   device's files over it; any local file that differs from the baseline is
- *   preserved as a conflict copy (join mode on the engine).
+ * - Pull the rebuilt baseline: downloads the rebuilt baseline without seeding
+ *   this device's files over it. Local files that differ are overwritten by
+ *   the baseline (server-revision last-write-wins); existing files whose names
+ *   contain `conflict-` are left untouched.
  */
 export class RecoverModal extends Modal {
   private password = "";
@@ -30,7 +31,6 @@ export class RecoverModal extends Modal {
     private mode: "reset" | "join",
     private onDone: () => void,
     private beforeReset: () => Promise<void>,
-    private enterJoin: () => void,
     private countSyncable: () => Promise<number>,
   ) {
     super(app);
@@ -45,7 +45,7 @@ export class RecoverModal extends Modal {
     contentEl.createEl("p", {
       text: reset
         ? "Your vault's sync history is corrupted or unusable. This device becomes the new baseline: the server's sync history for this vault is wiped (nothing on any device is deleted), then every local file below is uploaded with its real content."
-        : "This device downloads the rebuilt baseline from the server. Local files are not deleted, and any local file that differs from the baseline is kept as a conflict copy instead of being overwritten.",
+        : "This device downloads the rebuilt baseline from the server. Local files that differ from the baseline are overwritten by it; nothing is preserved as a conflict copy.",
     });
     contentEl.createEl("p", { text: `Vault: ${this.state.vaultName ?? this.state.vaultId ?? "?"}` });
 
@@ -121,17 +121,16 @@ export class RecoverModal extends Modal {
         });
         new Notice(`SyncVault: server history wiped — uploading ${count} files...`, 6000);
       } else {
-        // Join a rebuilt vault: download the new baseline but do NOT seed this
-        // device's local files over it; divergent local files become conflict
-        // copies via the engine's join mode.
-        this.enterJoin();
+        // Pull the rebuilt baseline: download it without re-seeding this
+        // device's files over it; divergent local files are overwritten by
+        // the baseline (last-write-wins) instead of being preserved.
         await this.state.save({
           lastRevision: 0,
           seeded: true,
           appliedPaths: [],
           pendingChanges: [],
         });
-        new Notice("SyncVault: pulling rebuilt baseline — local files are preserved...", 6000);
+        new Notice("SyncVault: pulling rebuilt baseline — local changes are overwritten...", 6000);
       }
       this.close();
       this.onDone();

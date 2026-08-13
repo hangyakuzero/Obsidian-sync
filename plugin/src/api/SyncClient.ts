@@ -12,9 +12,7 @@ export class ApiError extends Error {
   }
 }
 
-export type PushResult =
-  | { status: "accepted"; revision: number }
-  | { status: "conflict"; path: string; conflictPath?: string; serverRevision: number };
+export type PushResult = { status: "accepted"; revision: number };
 
 const TIMEOUTS = {
   auth: 10_000,

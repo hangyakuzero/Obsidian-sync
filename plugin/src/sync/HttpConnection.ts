@@ -128,16 +128,7 @@ export class HttpConnection implements Connection {
         return;
       }
       this.callbacks.onAuthed?.();
-      if (result.status === "accepted") {
-        this.callbacks.onAccepted(change.operationId, result.revision);
-      } else {
-        this.callbacks.onConflict({
-          operationId: change.operationId,
-          path: result.path,
-          conflictPath: result.conflictPath,
-          serverRevision: result.serverRevision,
-        });
-      }
+      this.callbacks.onAccepted(change.operationId, result.revision);
     } catch (e) {
       if (isApiError(e) && e.status === 401) {
         this.callbacks.onRetry?.(change.operationId, e.message);

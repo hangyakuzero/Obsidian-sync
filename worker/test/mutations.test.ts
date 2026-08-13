@@ -93,7 +93,7 @@ async function connect(accountId: string, vaultId: string, deviceId: string, tok
 }
 
 describe("mutation semantics", () => {
-  it("delete propagates and stale delete conflicts", async () => {
+  it("delete propagates and a stale delete is accepted (last-write-wins)", async () => {
     const t = await setup("mut1");
     const wsA = await connect(t.accountId, t.vaultId, `${t.accountId}-a-0001`, t.tokens[0]);
     const wsB = await connect(t.accountId, t.vaultId, `${t.accountId}-b-0001`, t.tokens[1]);
@@ -116,18 +116,18 @@ describe("mutation semantics", () => {
     expect(d1.change.operation).toBe("delete");
     expect(d1.change.path).toBe("gone.md");
 
-    // stale delete (based on rev 1 while server is at rev 2) -> conflict response, path untouched
-    const conflictP = nextMessage(wsB, (m) => m.type === "conflict");
+    // stale delete (based on rev 1 while server is at rev 2): accepted — the
+    // incoming commit is the latest word; no conflict response exists.
+    const accStale = nextMessage(wsB, (m) => m.type === "accepted");
     wsB.send(JSON.stringify({ type: "change", change: change({ deviceId: `${t.accountId}-b-0001`, path: "gone.md", operation: "delete", baseRevision: 1 }) }));
-    const conf = (await conflictP) as Extract<ServerMessage, { type: "conflict" }>;
-    expect(conf.path).toBe("gone.md");
-    expect(conf.conflictPath).toBeUndefined();
+    const stale = (await accStale) as Extract<ServerMessage, { type: "accepted" }>;
+    expect(stale.revision).toBe(3);
 
     const log = await env.VAULT_DO.getByName(t.vaultId).changesAfter(0);
-    expect(log.map((c) => c.operation)).toEqual(["create", "delete"]); // no third change from stale delete
+    expect(log.map((c) => c.operation)).toEqual(["create", "delete", "delete"]);
   });
 
-  it("rename propagates; rename onto a changed target conflicts", async () => {
+  it("rename propagates; a stale rename onto a changed target is accepted", async () => {
     const t = await setup("mut2");
     const wsA = await connect(t.accountId, t.vaultId, `${t.accountId}-a-0001`, t.tokens[0]);
     const wsB = await connect(t.accountId, t.vaultId, `${t.accountId}-b-0001`, t.tokens[1]);
@@ -156,16 +156,18 @@ describe("mutation semantics", () => {
     expect(r.change.oldPath).toBe("old.md");
     expect(r.change.path).toBe("moved.md");
 
-    // B renames moved.md -> target.md but target.md changed since B's base (rev 1 < 2) -> conflict
-    const conflictP = nextMessage(wsB, (m) => m.type === "conflict");
+    // B renames moved.md -> target.md based on stale rev 1: accepted (LWW);
+    // the incoming commit becomes the latest revision of the log.
+    const accStale = nextMessage(wsB, (m) => m.type === "accepted");
     wsB.send(JSON.stringify({ type: "change", change: change({ deviceId: `${t.accountId}-b-0001`, path: "target.md", oldPath: "moved.md", operation: "rename", baseRevision: 1 }) }));
-    const conf = (await conflictP) as Extract<ServerMessage, { type: "conflict" }>;
-    expect(conf.path).toBe("target.md");
+    const stale = (await accStale) as Extract<ServerMessage, { type: "accepted" }>;
+    expect(stale.revision).toBe(4);
 
     const log = await env.VAULT_DO.getByName(t.vaultId).changesAfter(0);
     const renames = log.filter((c) => c.operation === "rename");
-    expect(renames).toHaveLength(1); // the conflicting rename was rejected
+    expect(renames).toHaveLength(2);
     expect(renames[0]).toMatchObject({ oldPath: "old.md", path: "moved.md" });
+    expect(renames[1]).toMatchObject({ oldPath: "moved.md", path: "target.md" });
   });
 
   it("operation receipts survive GC for at-least-once retry safety", async () => {
