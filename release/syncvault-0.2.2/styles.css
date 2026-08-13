@@ -1,0 +1,75 @@
+/*
+ * SyncVault: scoped layout fixes for the settings tab and modals.
+ * Everything is namespaced under .syncvault-settings / .syncvault-modal so
+ * Obsidian's own UI is never affected.
+ */
+
+.syncvault-settings .setting-item,
+.syncvault-modal .setting-item {
+  min-width: 0;
+}
+
+.syncvault-settings .setting-item-info,
+.syncvault-settings .setting-item-control,
+.syncvault-modal .setting-item-info,
+.syncvault-modal .setting-item-control {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.syncvault-settings .setting-item-control,
+.syncvault-modal .setting-item-control {
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.syncvault-settings .setting-item-control > *,
+.syncvault-modal .setting-item-control > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.syncvault-settings button,
+.syncvault-modal button {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  height: auto;
+}
+
+.syncvault-settings input[type="text"],
+.syncvault-settings input[type="password"],
+.syncvault-settings select,
+.syncvault-modal input[type="text"],
+.syncvault-modal input[type="password"],
+.syncvault-modal select {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.syncvault-modal {
+  max-width: 100%;
+  max-height: calc(100dvh - 3rem);
+  overflow-y: auto;
+  overflow-x: hidden;
+  box-sizing: border-box;
+}
+
+@media (max-width: 480px) {
+  .syncvault-settings .setting-item,
+  .syncvault-modal .setting-item {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .syncvault-settings .setting-item-control,
+  .syncvault-modal .setting-item-control {
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+}
