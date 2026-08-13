@@ -3,7 +3,8 @@ import type SyncVaultPlugin from "../main";
 import { SyncState } from "../state/SyncState";
 import { AuthManager } from "../auth/AuthManager";
 import { WelcomeModal } from "./WelcomeModal";
-import { RebuildModal } from "./RebuildModal";
+import { RecoverModal } from "./RecoverModal";
+import { ReconnectModal } from "./ReconnectModal";
 import { SyncClient } from "../api/SyncClient";
 import type { SyncEngine, SyncStatus } from "../sync/SyncEngine";
 
@@ -21,7 +22,7 @@ const STATUS_LABELS: Record<SyncStatus, string> = {
 export class SyncVaultSettingsTab extends PluginSettingTab {
   constructor(
     app: App,
-    plugin: SyncVaultPlugin,
+    private plugin: SyncVaultPlugin,
     private state: SyncState,
     private auth: AuthManager,
     private client: SyncClient,
@@ -77,30 +78,87 @@ export class SyncVaultSettingsTab extends PluginSettingTab {
         );
     }
 
+    // Visual appearance mirror: appearance.json + installed themes. Applied
+    // appearances are written to the vault config dir and take effect on the
+    // next Obsidian restart (passive — we never hot-swap the UI).
+    const visualEnabled = this.state.visualSync;
     new Setting(containerEl)
-      .setName("Rescue")
-      .setDesc("Recover a vault whose server history is corrupted (e.g. old builds uploaded files without content).")
+      .setName("Sync visual appearance")
+      .setDesc(
+        "Mirrors appearance.json and installed themes between devices. " +
+          (this.plugin.lastVisualApplyAt > 0
+            ? "Changes will apply after Obsidian restarts."
+            : "Applied appearances take effect after Obsidian restarts."),
+      )
+      .addToggle((t) =>
+        t
+          .setValue(visualEnabled)
+          .setTooltip("Mirror themes and selected appearance between devices")
+          .onChange((v) => {
+            void this.state.save({ visualSync: v }).then(() => this.display());
+          }),
+      )
+      .addButton((b) =>
+        b.setButtonText("Sync visual files now").onClick(() => {
+          this.plugin.syncVisualNow();
+          new Notice("SyncVault: visual files queued for sync");
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Recover sync")
+      .setDesc("Last resort when the server history is unusable (e.g. old builds uploaded files without content).")
       .addButton((b) =>
         b
-          .setButtonText("Rebuild vault from this device")
+          .setButtonText("Reset baseline from this device")
           .setWarning()
           .onClick(() => {
-            new RebuildModal(this.app, this.state, this.client, "rebuild", () => {
-              void this.engine.resume();
-              this.display();
-            }, () => this.engine.resetForRebuild()).open();
+            new RecoverModal(
+              this.app,
+              this.state,
+              this.client,
+              "reset",
+              () => {
+                void this.engine.resume();
+                this.display();
+              },
+              () => this.engine.resetForRebuild(),
+              () => this.engine.enterJoinMode(),
+              () => this.engine.countSyncableFiles(),
+            ).open();
           }),
       )
       .addButton((b) =>
         b
-          .setButtonText("Join rebuilt vault")
+          .setButtonText("Pull rebuilt baseline")
           .setWarning()
           .onClick(() => {
-            new RebuildModal(this.app, this.state, this.client, "join", () => {
-              void this.engine.resume();
-              this.display();
-            }, () => this.engine.resetForRebuild()).open();
+            new RecoverModal(
+              this.app,
+              this.state,
+              this.client,
+              "join",
+              () => {
+                void this.engine.resume();
+                this.display();
+              },
+              () => this.engine.resetForRebuild(),
+              () => this.engine.enterJoinMode(),
+              () => this.engine.countSyncableFiles(),
+            ).open();
           }),
+      );
+
+    new Setting(containerEl)
+      .setName("Reconnect vault")
+      .setDesc("Rotate this device's sync token after authentication problems. Files, pending changes and sync state are kept.")
+      .addButton((b) =>
+        b.setButtonText("Reconnect").setCta().onClick(() => {
+          new ReconnectModal(this.app, this.auth, () => {
+            this.engine.authRecovered();
+            this.display();
+          }).open();
+        }),
       );
 
     new Setting(containerEl).addButton((b) =>

@@ -201,10 +201,10 @@ describe("vault sync core", () => {
     // malicious payload too large
     await expect(
       stub.submitChange(
-        change({ operationId: "op-4", path: "b.md", operation: "create", baseRevision: 0, payload: "b".repeat(1.5e6), deviceId }),
+        change({ operationId: "op-4", path: "b.md", operation: "create", baseRevision: 0, payload: "b".repeat(24e6), deviceId }),
         deviceId,
       ),
-    ).rejects.toThrow(/exceeds size limit/);
+    ).rejects.toThrow(/exceeds inline size limit/);
   });
 
   it("rejects payload-less create/update changes", async () => {

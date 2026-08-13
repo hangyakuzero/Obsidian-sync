@@ -1,7 +1,15 @@
-import { isValidBase64, normalizePath, type Change } from "@syncvault/shared";
+import { isValidBase64, isValidContentReference, normalizePath, type Change } from "@syncvault/shared";
+import type { JournalEntry } from "../storage/Journal";
 
 export interface QueuedChange extends Change {
   attempts: number;
+  causalParents?: string[];
+  inFlight?: boolean;
+  /** Durable staged-file key under the plugin's excluded staging directory. */
+  stagedFile?: string;
+  /** Server-rejected (4xx) changes are parked, never discarded. */
+  blocked?: boolean;
+  blockedReason?: string;
 }
 
 export interface SyncVaultData {
@@ -16,6 +24,10 @@ export interface SyncVaultData {
   pendingChanges: QueuedChange[];
   seeded: boolean;
   appliedPaths: string[];
+  /** Capped applied-operation journal; authority for "already applied". */
+  journal: JournalEntry[];
+  /** Mirror appearance.json + installed themes between devices (`syncvault-visual/…`). */
+  visualSync: boolean;
 }
 
 export interface SyncStateBackend {
@@ -29,13 +41,17 @@ export const DEFAULT_SYNC_DATA: SyncVaultData = {
   pendingChanges: [],
   seeded: false,
   appliedPaths: [],
+  journal: [],
+  visualSync: true,
 };
 
 export class SyncState {
   private data: SyncVaultData;
+  private loaded: Promise<void> = Promise.resolve();
+  private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(private backend?: SyncStateBackend) {
-    this.data = { ...DEFAULT_SYNC_DATA, pendingChanges: [] };
+    this.data = { ...DEFAULT_SYNC_DATA, pendingChanges: [], journal: [], appliedPaths: [] };
   }
 
   get connected(): boolean {
@@ -46,6 +62,10 @@ export class SyncState {
 
   get serverUrl(): string {
     return this.data.serverUrl;
+  }
+
+  get visualSync(): boolean {
+    return this.data.visualSync === true;
   }
 
   get accountId(): string | undefined {
@@ -80,19 +100,35 @@ export class SyncState {
     return this.data.pendingChanges;
   }
 
+  get journal(): JournalEntry[] {
+    return this.data.journal;
+  }
+
   async load(): Promise<void> {
-    const saved = await this.backend?.load();
-    if (saved) {
-      this.data = { ...DEFAULT_SYNC_DATA, pendingChanges: [], ...saved };
-      this.data.lastRevision = this.validRevision(this.data.lastRevision);
-      this.data.seeded = this.data.seeded === true;
-      this.data.pendingChanges = Array.isArray(this.data.pendingChanges)
-        ? this.data.pendingChanges.filter((change) => this.validQueuedChange(change))
-        : [];
-      this.data.appliedPaths = Array.isArray(this.data.appliedPaths)
-        ? this.data.appliedPaths.filter((path) => this.validPath(path))
-        : [];
-    }
+    this.loaded = (async () => {
+      const saved = await this.backend?.load();
+      if (saved) {
+        this.data = {
+          ...DEFAULT_SYNC_DATA,
+          pendingChanges: [],
+          journal: [],
+          appliedPaths: [],
+          ...saved,
+        };
+        this.data.lastRevision = this.validRevision(this.data.lastRevision);
+        this.data.seeded = this.data.seeded === true;
+        this.data.pendingChanges = Array.isArray(this.data.pendingChanges)
+          ? this.data.pendingChanges.filter((change) => this.validQueuedChange(change))
+          : [];
+        this.data.appliedPaths = Array.isArray(this.data.appliedPaths)
+          ? this.data.appliedPaths.filter((path) => this.validPath(path))
+          : [];
+        this.data.journal = Array.isArray(this.data.journal)
+          ? this.data.journal.filter((e) => this.validJournalEntry(e)).slice(-500)
+          : [];
+      }
+    })();
+    await this.loaded;
   }
 
   get seeded(): boolean {
@@ -127,9 +163,36 @@ export class SyncState {
     }
   }
 
+  /**
+   * Mutations apply synchronously (so callers never see stale state) but the
+   * backend write is serialized: concurrent queue writes, cursor updates,
+   * seeded markers, journal updates, and recovery changes cannot overwrite one
+   * another, and the latest snapshot always lands last.
+   */
   async save(patch: Partial<SyncVaultData>): Promise<void> {
+    if (typeof patch.lastRevision === "number") {
+      // Cursor writes are monotonic even under concurrency.
+      Object.assign(this.data, { ...patch, lastRevision: Math.max(this.data.lastRevision, patch.lastRevision) });
+    } else {
+      Object.assign(this.data, patch);
+    }
+    const snapshot = { ...this.data };
+    const write = this.writeQueue.then(() => this.backend?.save(snapshot));
+    this.writeQueue = write.catch(() => undefined);
+    await write;
+  }
+
+  /**
+   * Deliberate local resets (disconnect, rebuild, join, recovery) regress the
+   * cursor and clear sync state on purpose; the monotonic guard must not fight
+   * them. Identity fields passed in `patch` are kept.
+   */
+  async resetSyncState(patch: Partial<SyncVaultData>): Promise<void> {
     Object.assign(this.data, patch);
-    await this.backend?.save(this.data);
+    const snapshot = { ...this.data };
+    const write = this.writeQueue.then(() => this.backend?.save(snapshot));
+    this.writeQueue = write.catch(() => undefined);
+    await write;
   }
 
   async setServerUrl(url: string): Promise<void> {
@@ -143,7 +206,7 @@ export class SyncState {
   }
 
   async disconnect(): Promise<void> {
-    await this.save({
+    await this.resetSyncState({
       accountId: undefined,
       vaultId: undefined,
       vaultName: undefined,
@@ -154,6 +217,7 @@ export class SyncState {
       pendingChanges: [],
       seeded: false,
       appliedPaths: [],
+      journal: [],
     });
   }
 
@@ -169,6 +233,24 @@ export class SyncState {
     } catch {
       return false;
     }
+  }
+
+  private validJournalEntry(entry: unknown): entry is JournalEntry {
+    if (!entry || typeof entry !== "object") return false;
+    const e = entry as Partial<JournalEntry>;
+    if (
+      typeof e.operationId !== "string" ||
+      e.operationId.length === 0 ||
+      typeof e.revision !== "number" ||
+      !Number.isSafeInteger(e.revision) ||
+      e.revision < 0 ||
+      !Array.isArray(e.paths) ||
+      e.paths.length === 0 ||
+      !e.paths.every((p) => this.validPath(p))
+    ) {
+      return false;
+    }
+    return true;
   }
 
   private validQueuedChange(change: unknown): change is QueuedChange {
@@ -193,11 +275,34 @@ export class SyncState {
       return false;
     }
     if (item.oldPath !== undefined && !this.validPath(item.oldPath)) return false;
-    if (
-      (item.operation === "create" || item.operation === "update") &&
-      (typeof item.payload !== "string" || !isValidBase64(item.payload))
-    ) {
-      return false;
+    if (item.causalParents !== undefined) {
+      if (
+        !Array.isArray(item.causalParents) ||
+        item.causalParents.some((p) => typeof p !== "string")
+      ) {
+        return false;
+      }
+    }
+    if (item.inFlight !== undefined && typeof item.inFlight !== "boolean") return false;
+    if (item.blocked !== undefined && typeof item.blocked !== "boolean") return false;
+    if (item.blockedReason !== undefined && typeof item.blockedReason !== "string") return false;
+    if (item.stagedFile !== undefined) {
+      // Staging keys are bare filenames (hex operation ids); reject traversal.
+      if (
+        typeof item.stagedFile !== "string" ||
+        item.stagedFile.length === 0 ||
+        item.stagedFile.includes("/") ||
+        item.stagedFile === "." ||
+        item.stagedFile === ".."
+      ) {
+        return false;
+      }
+    }
+    if (item.operation === "create" || item.operation === "update") {
+      const hasPayload = typeof item.payload === "string" && isValidBase64(item.payload);
+      const hasContent =
+        item.content !== undefined && isValidContentReference(item.content);
+      if (!hasPayload && !hasContent) return false;
     }
     return item.operation === "create" ||
       item.operation === "update" ||

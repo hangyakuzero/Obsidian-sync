@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ChangeQueue } from "../src/sync/ChangeQueue";
-import { SyncState, SyncStateBackend } from "../src/state/SyncState";
+import { SyncState, SyncStateBackend, QueuedChange } from "../src/state/SyncState";
 import type { Change } from "@syncvault/shared";
 
 function makeState(): { state: SyncState; reload: () => Promise<SyncState> } {
@@ -103,5 +103,63 @@ describe("ChangeQueue", () => {
     await queue.enqueue(c);
     await queue.enqueue({ ...c, operationId: "op-2" });
     expect(queue.size()).toBe(1);
+  });
+
+  it("superseded ops never appear in the causal parents of their successor", async () => {
+    const { state } = makeState();
+    const queue = new ChangeQueue(state);
+    await queue.enqueue(change({ operationId: "op-1", operation: "update", path: "a.md", payload: "dgE=" }));
+    await queue.enqueue(change({ operationId: "op-2", operation: "update", path: "a.md", payload: "dgIy" }));
+    expect(queue.size()).toBe(1);
+    expect(queue.items[0].operationId).toBe("op-2");
+    expect(queue.items[0].causalParents).toEqual([]);
+  });
+
+  it("records in-flight ops as causal parents and scrubs them when dropped", async () => {
+    const { state } = makeState();
+    const queue = new ChangeQueue(state);
+    await queue.enqueue(change({ operationId: "op-1", operation: "update", path: "a.md", payload: "dgE=" }));
+    (queue.get("op-1") as QueuedChange & { inFlight?: boolean }).inFlight = true;
+    // A second write while the first is in-flight cannot supersede it.
+    await queue.enqueue(change({ operationId: "op-2", operation: "update", path: "a.md", payload: "dgIy" }));
+    expect(queue.size()).toBe(2);
+    expect(queue.get("op-2")?.causalParents).toEqual(["op-1"]);
+
+    // The server rejected op-1 (never committed): its id is scrubbed from
+    // op-2's parents so the next push does not fail allowedStale.
+    await queue.removeDropped("op-1");
+    expect(queue.size()).toBe(1);
+    expect(queue.get("op-2")?.causalParents).toEqual([]);
+  });
+
+  it("a rename split across in-flight and supersession keeps an ordered chain", async () => {
+    const { state } = makeState();
+    const queue = new ChangeQueue(state);
+    await queue.enqueue(change({ operationId: "op-1", operation: "update", path: "a.md", payload: "dgE=" }));
+    (queue.get("op-1") as QueuedChange & { inFlight?: boolean }).inFlight = true;
+    // A later write on the same path chains onto the in-flight op.
+    await queue.enqueue(change({ operationId: "op-2", operation: "update", path: "a.md", payload: "dgIy" }));
+    expect(queue.get("op-2")?.causalParents).toEqual(["op-1"]);
+    // Another device may have moved the file: a rename over a.md supersedes
+    // the in-flight write? No — in-flight ops are preserved, so the rename
+    // replaces only op-2 and chains onto op-1.
+    await queue.enqueue(change({ operationId: "op-3", operation: "rename", path: "b.md", oldPath: "a.md" }));
+    // op-2 was superseded by the rename (touches a.md, not in-flight)…
+    expect(queue.get("op-2")).toBeUndefined();
+    // …but the rename still carries op-1 (in-flight, preserved) as a parent.
+    expect(queue.get("op-3")?.causalParents).toEqual(["op-1"]);
+    expect(queue.size()).toBe(2);
+  });
+
+  it("dedupes content refs by hash, not by value only", async () => {
+    const { state } = makeState();
+    const queue = new ChangeQueue(state);
+    const content = { hash: "abc", byteLength: 3, chunkCount: 1 };
+    await queue.enqueue(change({ operationId: "op-1", operation: "create", path: "a.md", content }));
+    await queue.enqueue(change({ operationId: "op-2", operation: "create", path: "a.md", content }));
+    expect(queue.size()).toBe(1);
+    await queue.enqueue(change({ operationId: "op-3", operation: "create", path: "a.md", content: { hash: "def", byteLength: 3, chunkCount: 1 } }));
+    expect(queue.size()).toBe(1);
+    expect(queue.items[0].content?.hash).toBe("def");
   });
 });

@@ -22,6 +22,10 @@ export interface ExistingUserInput {
 }
 
 export class AuthManager {
+  get accountId(): string | undefined {
+    return this.state.accountId;
+  }
+
   constructor(
     private state: SyncState,
     private client: SyncClient,
@@ -89,5 +93,25 @@ export class AuthManager {
 
   async fetchVaults(accountId: string, password: string): Promise<VaultInfo[]> {
     return this.client.listVaultsByPassword(accountId.trim(), password);
+  }
+
+  /**
+   * Reconnect this device to its vault after authentication problems: the
+   * server rotates the device token in place (same identity). Cursor, queue,
+   * staging and journal are untouched.
+   */
+  async reconnect(password: string): Promise<void> {
+    const accountId = this.state.accountId;
+    const vaultId = this.state.vaultId;
+    const deviceId = this.state.deviceId;
+    if (!accountId || !vaultId || !deviceId) throw new Error("vault is not configured");
+    const { deviceToken } = await this.client.registerDevice(
+      accountId,
+      vaultId,
+      password,
+      deviceId,
+      this.state.deviceName ?? "Obsidian",
+    );
+    await this.state.save({ deviceToken });
   }
 }

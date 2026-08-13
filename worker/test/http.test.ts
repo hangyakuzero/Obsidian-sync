@@ -114,6 +114,48 @@ describe("HTTP sync endpoints", () => {
     expect(wrongVault.status).toBe(401);
   });
 
+  it("re-registering the same device rotates its token instead of locking it out", async () => {
+    const t = await setup("httprot");
+
+    // same identity re-registers -> 201 with a fresh token
+    const reg = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/devices`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: t.accountId, password: PASSWORD, deviceId: t.deviceId, name: "x" }),
+    });
+    expect(reg.status).toBe(201);
+    const { deviceToken } = (await reg.json()) as { deviceToken: string };
+    expect(deviceToken).not.toBe(t.token);
+
+    // the old token is now rejected
+    const oldAuth = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/sync?since=0`, {
+      headers: { Authorization: `Bearer ${t.accountId}:${t.deviceId}:${t.token}` },
+    });
+    expect(oldAuth.status).toBe(401);
+    // the rotated token works
+    const newAuth = await SELF.fetch(`http://localhost/v1/vaults/${t.vaultId}/sync?since=0`, {
+      headers: { Authorization: `Bearer ${t.accountId}:${t.deviceId}:${deviceToken}` },
+    });
+    expect(newAuth.status).toBe(200);
+
+    // the same device registered against a *different* vault of the same
+    // account is still rejected (devices are per-account, so foreign accounts
+    // can never collide with this row)
+    const vault2 = await SELF.fetch("http://localhost/v1/vaults", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: t.accountId, password: PASSWORD, name: "V2" }),
+    });
+    const { vaultId: vault2Id } = (await vault2.json()) as { vaultId: string };
+    const foreign = await SELF.fetch(`http://localhost/v1/vaults/${vault2Id}/devices`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: t.accountId, password: PASSWORD, deviceId: t.deviceId, name: "x" }),
+    });
+    expect(foreign.status).toBe(409);
+    expect(((await foreign.json()) as { error: string }).error).toBe("CONFLICT");
+  });
+
   it("push reports conflicts over HTTP and idempotent retries resolve", async () => {
     const t = await setup("httpt4");
     const vault = env.VAULT_DO.getByName(t.vaultId);

@@ -20,6 +20,11 @@ function isApiError(e: unknown): e is ApiError {
 export class HttpConnection implements Connection {
   private connectedFlag = false;
 
+  // HTTP knows nothing about broadcast order: a push accept replies with the
+  // server's global revision, which may skip interleaved remote changes. The
+  // cursor advances only when those changes are actually applied.
+  advanceCursorOnAccept = false;
+
   constructor(
     private state: SyncState,
     private client: SyncClient,
@@ -53,18 +58,25 @@ export class HttpConnection implements Connection {
         this.state.deviceToken ?? "",
         since,
       );
+      if (r.resyncRequired) {
+        this.callbacks.onResyncRequired?.();
+      }
       return { currentRevision: r.currentRevision, changes: r.changes, resyncRequired: r.resyncRequired };
     } catch (e) {
       if (isApiError(e) && e.status === 401) {
         this.callbacks.onAuthFailure?.("authentication expired; reconnect the vault");
+      } else if (isApiError(e) && e.code === "CLIENT_UPGRADE_REQUIRED") {
+        this.callbacks.onError?.(
+          "this vault uses SyncVault v2 content; update the plugin",
+        );
       }
       throw e;
     }
   }
 
-  sendChange(change: Change): boolean {
+  sendChange(change: Change, bytes?: Uint8Array): boolean {
     const p = this.params();
-    void this.push(change, p);
+    void this.push(change, bytes, p);
     return true;
   }
 
@@ -76,12 +88,38 @@ export class HttpConnection implements Connection {
     return true;
   }
 
+  async fetchContent(change: Change): Promise<Uint8Array | null> {
+    if (change.content === undefined || change.revision < 1) return null;
+    const p = this.params();
+    try {
+      return await this.client.downloadContent(
+        p.accountId,
+        p.vaultId,
+        p.deviceId,
+        p.token,
+        change.revision,
+        change.content,
+      );
+    } catch (e) {
+      this.callbacks.onError?.(`content download failed: ${(e as Error).message}`);
+      return null;
+    }
+  }
+
   private async push(
     change: Change,
+    bytes: Uint8Array | undefined,
     p: { accountId: string; vaultId: string; deviceId: string; token: string },
   ): Promise<void> {
     try {
-      const result = await this.client.pushChange(p.accountId, p.vaultId, p.deviceId, p.token, change);
+      const result =
+        change.content !== undefined && bytes !== undefined
+          ? await this.client.uploadContent(p.accountId, p.vaultId, p.deviceId, p.token, change, bytes)
+          : await this.client.pushChange(p.accountId, p.vaultId, p.deviceId, p.token, change);
+      if (result === null) {
+        this.callbacks.onRetry?.(change.operationId, "content upload failed");
+        return;
+      }
       if (result.status === "accepted") {
         this.callbacks.onAccepted(change.operationId, result.revision);
       } else {
@@ -98,6 +136,13 @@ export class HttpConnection implements Connection {
         this.callbacks.onAuthFailure?.("authentication expired; reconnect the vault");
         return;
       }
+      if (isApiError(e) && e.code === "RESYNC_REQUIRED") {
+        // History behind the retention window: keep the change queued and ask
+        // the user to recover; never drop local data on a server 4xx.
+        this.callbacks.onResyncRequired?.();
+        this.callbacks.onError?.(e.message);
+        return;
+      }
       if (isApiError(e) && e.status >= 400 && e.status < 500) {
         // Permanent rejection (payload required, bad path, too large):
         // drop the change and keep sync moving instead of retrying forever.
@@ -105,7 +150,7 @@ export class HttpConnection implements Connection {
         return;
       }
       this.callbacks.onRetry?.(change.operationId, (e as Error).message);
-      this.callbacks.onError(`push failed: ${(e as Error).message}`);
+      this.callbacks.onError?.(`push failed: ${(e as Error).message}`);
     }
   }
 

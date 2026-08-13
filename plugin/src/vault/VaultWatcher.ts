@@ -1,4 +1,5 @@
-import { Change, MAX_FILE_BYTES, normalizePath, toBase64 } from "@syncvault/shared";
+import { Change, CHUNK_BYTES, MAX_FILE_BYTES, normalizePath } from "@syncvault/shared";
+import { sha256Hex } from "../hashing/hash";
 
 export type NormalizedEvent =
   | { kind: "create" | "modify"; path: string }
@@ -10,17 +11,76 @@ export interface CaptureContext {
   getBaseRevision(): number;
   onChange(change: Change): Promise<void>;
   onTooLarge?(path: string, size: number): void;
+  /**
+   * Snapshot content bytes to durable staging before the change is queued.
+   * The queue references the staged file; the upload is served from the
+   * snapshot so a concurrently edited vault file cannot corrupt it.
+   */
+  stage?(operationId: string, bytes: Uint8Array<ArrayBuffer>): Promise<void>;
 }
 
 const DEBOUNCE_MS = 800;
-const SUPPRESS_TTL_MS = 60_000;
+// Expected operations live long enough for the filesystem watcher to fire
+// their follow-up events, and short enough that an immediately subsequent
+// local edit is still captured.
+const EXPECT_TTL_MS = 5_000;
 
+type ExpectedKind = "content" | "delete" | "rename";
+
+interface ExpectedOp {
+  kind: ExpectedKind;
+  sha?: string;
+  oldPath?: string;
+  until: number;
+  matchesLeft: number;
+}
+
+/**
+ * Capture + expected-op suppression. Remote writes are matched exactly
+ * (`{path, op, sha}`) rather than blanket-suppressed for a time window: a
+ * follow-up event is swallowed only when it matches what the engine is about
+ * to do (or just did) to the filesystem. A mismatched event — or a hash that
+ * differs from the written bytes — is a real local edit and queues normally.
+ */
 export class VaultWatcher {
   private pending = new Map<string, NormalizedEvent>();
-  private suppressed = new Map<string, number>();
+  private expected = new Map<string, ExpectedOp>();
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(private ctx: CaptureContext) {}
+  constructor(
+    private ctx: CaptureContext,
+    private ttlMs = EXPECT_TTL_MS,
+  ) {}
+
+  /**
+   * Record the filesystem write the engine is about to perform so its echo
+   * can be consumed without suppressing real local edits.
+   */
+  expect(
+    path: string,
+    kind: ExpectedKind,
+    opts: { sha?: string; oldPath?: string } = {},
+  ): void {
+    let normalized: string;
+    try {
+      normalized = normalizePath(path);
+    } catch {
+      return;
+    }
+    if (!this.isSyncable(normalized)) return;
+    this.expected.set(normalized, {
+      kind,
+      sha: opts.sha,
+      oldPath: opts.oldPath,
+      until: Date.now() + this.ttlMs,
+      matchesLeft: kind === "content" ? 3 : 2,
+    });
+  }
+
+  /** Clear all expectations (e.g. after a paused apply or on resume). */
+  releaseAll(): void {
+    this.expected.clear();
+  }
 
   track(ev: NormalizedEvent): void {
     let path: string;
@@ -31,8 +91,7 @@ export class VaultWatcher {
       return;
     }
     if (!this.isSyncable(path)) return;
-    if (this.isSuppressed(path)) return;
-    if (ev.kind === "rename" && this.isSuppressed(ev.oldPath!)) return;
+    if (this.consumeIfExpected(ev, path)) return;
 
     const key = this.keyOf(ev);
     if (ev.kind === "delete") {
@@ -89,22 +148,6 @@ export class VaultWatcher {
     this.scheduleFlush();
   }
 
-  /** Suppress vault events for paths being modified by remote-change application. */
-  suppress(paths: string[]): void {
-    const until = Date.now() + SUPPRESS_TTL_MS;
-    for (const p of paths) {
-      try {
-        this.suppressed.set(normalizePath(p), until);
-      } catch {
-        // ignore invalid paths
-      }
-    }
-  }
-
-  releaseAll(): void {
-    this.suppressed.clear();
-  }
-
   async flush(): Promise<void> {
     if (this.flushTimer !== null) {
       clearTimeout(this.flushTimer);
@@ -115,6 +158,45 @@ export class VaultWatcher {
     for (const ev of events) {
       await this.emitOne(ev);
     }
+  }
+
+  private consumeIfExpected(ev: NormalizedEvent, path: string): boolean {
+    const exp = this.expected.get(path);
+    if (!exp) return false;
+    if (exp.until < Date.now()) {
+      this.expected.delete(path);
+      return false;
+    }
+    if (ev.kind === "delete") {
+      if (exp.kind === "delete") {
+        this.consume(path, exp);
+        return true;
+      }
+      // A delete during an expected content/rename op is a real local edit.
+      this.expected.delete(path);
+      return false;
+    }
+    if (ev.kind === "rename") {
+      if (exp.kind === "rename" && exp.oldPath === ev.oldPath) {
+        this.consume(path, exp);
+        return true;
+      }
+      this.expected.delete(path);
+      return false;
+    }
+    // create/modify on an expected rename: post-rename metadata touch.
+    if (exp.kind === "rename") {
+      this.consume(path, exp);
+      return true;
+    }
+    // create/modify on an expected content write: matched by hash at flush
+    // time in emitOne, so it enters the pending set for now.
+    return false;
+  }
+
+  private consume(path: string, exp: ExpectedOp): void {
+    exp.matchesLeft -= 1;
+    if (exp.matchesLeft <= 0) this.expected.delete(path);
   }
 
   private scheduleFlush(): void {
@@ -158,15 +240,36 @@ export class VaultWatcher {
       this.ctx.onTooLarge?.(ev.path, bytes.byteLength);
       return;
     }
+    if (bytes.byteLength === 0) {
+      // Obsidian never saves empty files; skip rather than hash nothing.
+      return;
+    }
+    const data = new Uint8Array(bytes);
+    const exp = this.expected.get(ev.path);
+    if (exp && exp.until > Date.now() && exp.kind === "content") {
+      const hash = await sha256Hex(data);
+      if (exp.sha === undefined || hash === exp.sha) {
+        this.consume(ev.path, exp);
+        return;
+      }
+      // The bytes differ from what the engine wrote: a real local edit.
+      this.expected.delete(ev.path);
+    }
+    const operationId = this.newOperationId();
+    if (this.ctx.stage) await this.ctx.stage(operationId, data);
     const change: Change = {
-      operationId: this.newOperationId(),
+      operationId,
       revision: 0,
       deviceId: "",
       path: normalizePath(ev.path),
       operation: ev.kind === "modify" ? "update" : "create",
       baseRevision: this.ctx.getBaseRevision(),
       timestamp: Date.now(),
-      payload: toBase64(new Uint8Array(bytes)),
+      content: {
+        hash: await sha256Hex(data),
+        byteLength: data.byteLength,
+        chunkCount: Math.max(1, Math.ceil(data.byteLength / CHUNK_BYTES)),
+      },
     };
     await this.ctx.onChange(change);
   }
@@ -177,16 +280,6 @@ export class VaultWatcher {
 
   private isSyncable(path: string): boolean {
     if (path === ".obsidian" || path.startsWith(".obsidian/")) return false;
-    return true;
-  }
-
-  private isSuppressed(path: string): boolean {
-    const until = this.suppressed.get(path);
-    if (until === undefined) return false;
-    if (until < Date.now()) {
-      this.suppressed.delete(path);
-      return false;
-    }
     return true;
   }
 

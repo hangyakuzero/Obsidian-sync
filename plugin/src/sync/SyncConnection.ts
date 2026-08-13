@@ -1,16 +1,27 @@
 import { Change, ClientMessage, ServerMessage } from "@syncvault/shared";
+import { CHUNK_CAPABILITY } from "@syncvault/shared";
+import { SyncClient } from "../api/SyncClient";
 
 export type ConnectionStatus = "idle" | "connecting" | "open" | "offline";
 
 export interface Connection {
   connected: boolean;
+  /**
+   * Whether an `accepted` reply may advance the local cursor. True only for
+   * transports whose broadcast ordering guarantees the pushing device has
+   * already seen every earlier revision (WebSocket FIFO); HTTP is false —
+   * interleaved remote revisions must be applied before the cursor moves.
+   */
+  advanceCursorOnAccept: boolean;
   connect(): void;
   disconnect(): void;
-  sendChange(change: Change): boolean;
+  sendChange(change: Change, bytes?: Uint8Array): boolean;
   sendAck(revision: number): boolean;
   pull(
     since: number,
   ): Promise<{ currentRevision: number; changes: Change[]; resyncRequired: boolean }>;
+  /** Fetches and verifies the bytes behind a change's content reference. */
+  fetchContent(change: Change): Promise<Uint8Array | null>;
 }
 
 export interface ConnectionParams {
@@ -30,12 +41,13 @@ export interface ConnectionCallbacks {
   onRejected?(operationId: string, code: string, message: string): void;
   onAuthFailure?(message: string): void;
   onRetry?(operationId: string, message: string): void;
+  onResyncRequired?(message?: string): void;
   onError(message: string): void;
   onStatusChange(status: ConnectionStatus): void;
 }
 
 const RETRY_BACKOFFS = [2000, 5000, 10_000, 30_000];
-const FATAL_CLOSE_REASONS = new Set([4001, 4400, 4401, 4402]);
+const FATAL_CLOSE_REASONS = new Set([4001, 4400, 4401, 4402, 4403]);
 
 export class SyncConnection implements Connection {
   private ws: WebSocket | null = null;
@@ -44,11 +56,16 @@ export class SyncConnection implements Connection {
   private retryIndex = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private remoteChain: Promise<void> = Promise.resolve();
+  private client: SyncClient | null = null;
 
   constructor(
     private params: () => ConnectionParams,
     private callbacks: ConnectionCallbacks,
   ) {}
+
+  // WebSocket broadcasts arrive in server revision order on a single FIFO
+  // socket, so an accepted reply always follows every earlier revision.
+  advanceCursorOnAccept = true;
 
   // Realtime transport: changes arrive live via the socket; nothing to poll.
   async pull(): Promise<{ currentRevision: number; changes: Change[]; resyncRequired: boolean }> {
@@ -71,7 +88,15 @@ export class SyncConnection implements Connection {
         if (typeof ws !== "undefined" && ws !== this.ws) return;
         this.retryIndex = 0;
         const p = this.params();
-        this.send({ type: "hello", accountId: p.accountId, vaultId: p.vaultId, deviceId: p.deviceId, token: p.token, lastRevision: p.getLastRevision() });
+        this.send({
+          type: "hello",
+          accountId: p.accountId,
+          vaultId: p.vaultId,
+          deviceId: p.deviceId,
+          token: p.token,
+          lastRevision: p.getLastRevision(),
+          capabilities: [CHUNK_CAPABILITY],
+        });
       };
       ws.onmessage = (event) => this.dispatch(event);
       ws.onclose = (event) => this.handleClose(event);
@@ -99,12 +124,68 @@ export class SyncConnection implements Connection {
     this.setStatus("idle");
   }
 
-  sendChange(change: Change): boolean {
+  sendChange(change: Change, bytes?: Uint8Array): boolean {
+    // Chunked content cannot travel over the socket; upload the bytes over
+    // HTTP first, then announce the change on the socket for ordering.
+    if (change.content !== undefined && bytes !== undefined) {
+      this.uploadAndAnnounce(change, bytes);
+      return true;
+    }
     return this.send({ type: "change", change });
   }
 
   sendAck(revision: number): boolean {
     return this.send({ type: "ack", revision });
+  }
+
+  async fetchContent(change: Change): Promise<Uint8Array | null> {
+    if (change.content === undefined || change.revision < 1) return null;
+    return this.httpClient().downloadContent(
+      this.params().accountId,
+      this.params().vaultId,
+      this.params().deviceId,
+      this.params().token,
+      change.revision,
+      change.content,
+    );
+  }
+
+  private async uploadAndAnnounce(change: Change, bytes: Uint8Array): Promise<void> {
+    const p = this.params();
+    try {
+      const result = await this.httpClient().uploadContent(
+        p.accountId,
+        p.vaultId,
+        p.deviceId,
+        p.token,
+        change,
+        bytes,
+      );
+      if (result === null) {
+        this.callbacks.onRetry?.(change.operationId, "content upload failed");
+        return;
+      }
+      if (result.status === "accepted") {
+        // Announcement still travels over the socket so the broadcast order
+        // stays intact; the accepted reply will resolve the pending ack.
+        this.send({ type: "change", change: { ...change, deviceId: p.deviceId } });
+      } else {
+        this.callbacks.onConflict({
+          operationId: change.operationId,
+          path: result.path,
+          conflictPath: result.conflictPath,
+          serverRevision: result.serverRevision,
+        });
+      }
+    } catch (e) {
+      this.callbacks.onRetry?.(change.operationId, (e as Error).message);
+      this.callbacks.onError(`upload failed: ${(e as Error).message}`);
+    }
+  }
+
+  private httpClient(): SyncClient {
+    if (this.client === null) this.client = new SyncClient(this.params().serverUrl);
+    return this.client;
   }
 
   private wsUrl(): string {
@@ -144,30 +225,34 @@ export class SyncConnection implements Connection {
     switch (msg.type) {
       case "welcome":
         this.setStatus("open");
-        this.remoteChain = this.remoteChain
-          .then(() => this.callbacks.onWelcome(msg.serverRevision, msg.resyncRequired))
-          .catch(() => undefined);
+        this.chain(() => this.callbacks.onWelcome(msg.serverRevision, msg.resyncRequired));
         break;
       case "change":
-        this.remoteChain = this.remoteChain
-          .then(() => this.callbacks.onRemoteChange(msg.change))
-          .catch(() => undefined);
+        this.chain(() => this.callbacks.onRemoteChange(msg.change));
         break;
       case "accepted":
-        this.callbacks.onAccepted(msg.operationId, msg.revision);
+        // Serialized behind every preceding remote application so the push
+        // cursor optimization can never skip a revision the server broadcast.
+        this.chain(() => this.callbacks.onAccepted(msg.operationId, msg.revision));
         break;
       case "conflict":
-        this.callbacks.onConflict({
-          operationId: msg.operationId,
-          path: msg.path,
-          conflictPath: msg.conflictPath,
-          serverRevision: msg.serverRevision,
-        });
+        this.chain(() =>
+          this.callbacks.onConflict({
+            operationId: msg.operationId,
+            path: msg.path,
+            conflictPath: msg.conflictPath,
+            serverRevision: msg.serverRevision,
+          }),
+        );
         break;
       case "error":
         this.callbacks.onError(msg.message);
         break;
     }
+  }
+
+  private chain(cb: () => void | Promise<void>): void {
+    this.remoteChain = this.remoteChain.then(cb).catch(() => undefined);
   }
 
   private handleClose(event: CloseEvent): void {

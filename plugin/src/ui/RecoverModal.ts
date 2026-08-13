@@ -3,7 +3,7 @@ import { SyncClient, ApiError } from "../api/SyncClient";
 import { SyncState } from "../state/SyncState";
 import { friendlyApiMessage } from "./friendlyErrors";
 
-export interface RebuildContext {
+export interface RecoverContext {
   accountId?: string;
   vaultId?: string;
   vaultName?: string;
@@ -11,16 +11,27 @@ export interface RebuildContext {
   deviceToken?: string;
 }
 
-export class RebuildModal extends Modal {
+/**
+ * Guided "Recover sync" flow, replacing the old Rebuild/Join modals.
+ *
+ * - Reset baseline from this device: wipes server history after a local safety
+ *   check (this device must actually hold syncable files to seed).
+ * - Pull the rebuilt baseline: downloads the new baseline without seeding this
+ *   device's files over it; any local file that differs from the baseline is
+ *   preserved as a conflict copy (join mode on the engine).
+ */
+export class RecoverModal extends Modal {
   private password = "";
 
   constructor(
     app: App,
     private state: SyncState,
     private client: SyncClient,
-    private mode: "rebuild" | "join",
+    private mode: "reset" | "join",
     private onDone: () => void,
     private beforeReset: () => Promise<void>,
+    private enterJoin: () => void,
+    private countSyncable: () => Promise<number>,
   ) {
     super(app);
   }
@@ -28,18 +39,16 @@ export class RebuildModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
-    const rebuild = this.mode === "rebuild";
-    contentEl.createEl("h2", { text: rebuild ? "Rebuild vault from this device" : "Join rebuilt vault" });
+    const reset = this.mode === "reset";
+    contentEl.createEl("h2", { text: "Recover sync" });
     contentEl.createEl("p", {
-      text: rebuild
-        ? "This device's files become the new vault baseline. The server's sync history for this vault is wiped (nothing on any device is deleted), then every local file is uploaded with its real content."
-        : "This device downloads the rebuilt vault contents from the server. Local files on this device are not deleted, but files present in the rebuilt vault will overwrite local copies.",
+      text: reset
+        ? "Your vault's sync history is corrupted or unusable. This device becomes the new baseline: the server's sync history for this vault is wiped (nothing on any device is deleted), then every local file below is uploaded with its real content."
+        : "This device downloads the rebuilt baseline from the server. Local files are not deleted, and any local file that differs from the baseline is kept as a conflict copy instead of being overwritten.",
     });
-    contentEl.createEl("p", {
-      text: `Vault: ${this.state.vaultName ?? this.state.vaultId ?? "?"}`,
-    });
+    contentEl.createEl("p", { text: `Vault: ${this.state.vaultName ?? this.state.vaultId ?? "?"}` });
 
-    if (rebuild) {
+    if (reset) {
       new Setting(contentEl).setName("Account password").addText((t) => {
         t.inputEl.type = "password";
         t.setPlaceholder("required — confirms you own this account");
@@ -53,7 +62,7 @@ export class RebuildModal extends Modal {
     new Setting(contentEl)
       .addButton((b) =>
         b
-          .setButtonText(rebuild ? "Rebuild (wipes server history)" : "Join rebuilt vault")
+          .setButtonText(reset ? "Reset baseline from this device" : "Pull rebuilt baseline")
           .setWarning()
           .onClick(() => void this.submit()),
       )
@@ -63,8 +72,8 @@ export class RebuildModal extends Modal {
   }
 
   private async submit(): Promise<void> {
-    const rebuild = this.mode === "rebuild";
-    const ctx: RebuildContext = {
+    const reset = this.mode === "reset";
+    const ctx: RecoverContext = {
       accountId: this.state.accountId,
       vaultId: this.state.vaultId,
       vaultName: this.state.vaultName,
@@ -77,9 +86,19 @@ export class RebuildModal extends Modal {
     }
     try {
       await this.beforeReset();
-      if (rebuild) {
+      if (reset) {
         if (!this.password) {
           new Notice("SyncVault: account password required", 5000);
+          return;
+        }
+        // Local safety check: refuse to wipe server history when this device
+        // has nothing to seed, or we cannot verify it does.
+        const count = await this.countSyncable();
+        if (count <= 0) {
+          new Notice(
+            "SyncVault: no syncable files found on this device to seed. Recovering from here would leave the vault empty. Aborting.",
+            8000,
+          );
           return;
         }
         const confirm = ctx.vaultName ?? ctx.vaultId;
@@ -99,17 +118,19 @@ export class RebuildModal extends Modal {
           appliedPaths: [],
           pendingChanges: [],
         });
-        new Notice("SyncVault: server history wiped — uploading files...", 6000);
+        new Notice(`SyncVault: server history wiped — uploading ${count} files...`, 6000);
       } else {
         // Join a rebuilt vault: download the new baseline but do NOT seed this
-        // device's local files over it.
+        // device's local files over it; divergent local files become conflict
+        // copies via the engine's join mode.
+        this.enterJoin();
         await this.state.save({
           lastRevision: 0,
           seeded: true,
           appliedPaths: [],
           pendingChanges: [],
         });
-        new Notice("SyncVault: joining rebuilt vault — downloading...", 6000);
+        new Notice("SyncVault: pulling rebuilt baseline — local files are preserved...", 6000);
       }
       this.close();
       this.onDone();

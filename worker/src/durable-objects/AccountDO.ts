@@ -167,9 +167,27 @@ export class AccountDO extends DurableObject<Env> {
     if (!vault) return fail("NOT_FOUND", "vault not found");
 
     const existing = this.ctx.storage.sql
-      .exec<{ device_id: string }>("SELECT device_id FROM devices WHERE device_id = ?", deviceId)
+      .exec<{ account_id: string; vault_id: string }>(
+        "SELECT account_id, vault_id FROM devices WHERE device_id = ?",
+        deviceId,
+      )
       .toArray()[0];
-    if (existing) return fail("CONFLICT", "device already registered");
+    if (existing) {
+      if (existing.account_id !== accountId || existing.vault_id !== vaultId) {
+        return fail("CONFLICT", "device already registered");
+      }
+      // Same identity re-registering (e.g. reconnect after a lost token):
+      // rotate the token in place instead of locking the device out.
+      const deviceToken = randomHex(32);
+      const tokenHash = await hashToken(deviceToken);
+      this.ctx.storage.sql.exec(
+        "UPDATE devices SET token_hash = ?, name = ? WHERE device_id = ?",
+        tokenHash,
+        (name || "device").slice(0, 100),
+        deviceId,
+      );
+      return ok({ deviceToken });
+    }
 
     const deviceToken = randomHex(32);
     const tokenHash = await hashToken(deviceToken);

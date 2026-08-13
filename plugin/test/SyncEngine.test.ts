@@ -1,30 +1,37 @@
 import { describe, expect, it, vi } from "vitest";
-import { SyncEngine, SyncStatus, VaultOps, Connection } from "../src/sync/SyncEngine";
+import { SyncEngine, SyncStatus, VaultOps, Connection, EngineOptions } from "../src/sync/SyncEngine";
 import { ConnectionCallbacks } from "../src/sync/SyncConnection";
 import { ChangeQueue } from "../src/sync/ChangeQueue";
 import { VaultWatcher } from "../src/vault/VaultWatcher";
 import { SyncState, SyncStateBackend } from "../src/state/SyncState";
+import { MemoryStaging } from "../src/storage/Staging";
 import { Change, fromBase64, toBase64 } from "@syncvault/shared";
+import { sha256Hex } from "../src/hashing/hash";
+import { AuthManager } from "../src/auth/AuthManager";
+import { SyncClient } from "../src/api/SyncClient";
 
 class FakeConnection implements Connection {
   connected = true;
+  advanceCursorOnAccept = true;
   sent: Change[] = [];
   acks: number[] = [];
   handlers: ConnectionCallbacks;
+  contentByPath = new Map<string, Uint8Array<ArrayBuffer>>();
 
   constructor(handlers: ConnectionCallbacks) {
     this.handlers = handlers;
   }
 
   connect(): void {
-    // no-op; auto-connected
+    // no-op; the test toggles `connected` manually (mirrors the transport's
+    // connected flag, which the engine can only influence via connect()).
   }
 
   disconnect(): void {
     this.connected = false;
   }
 
-  sendChange(change: Change): boolean {
+  sendChange(change: Change, bytes?: Uint8Array): boolean {
     this.sent.push(change);
     return true;
   }
@@ -32,6 +39,10 @@ class FakeConnection implements Connection {
   sendAck(revision: number): boolean {
     this.acks.push(revision);
     return true;
+  }
+
+  async fetchContent(change: Change): Promise<Uint8Array<ArrayBuffer> | null> {
+    return this.contentByPath.get(change.path) ?? null;
   }
 
   async pull(): Promise<{ currentRevision: number; changes: Change[]; resyncRequired: boolean }> {
@@ -65,14 +76,16 @@ interface Rig {
   writes: { path: string; bytes: Uint8Array }[];
   removes: string[];
   renames: { oldPath: string; newPath: string }[];
+  files: Map<string, Uint8Array<ArrayBuffer>>;
 }
 
-function makeRig(): Rig {
+function makeRig(options: EngineOptions = {}): Rig {
   const state = makeConfiguredState();
   const queue = new ChangeQueue(state);
   const writes: { path: string; bytes: Uint8Array }[] = [];
   const removes: string[] = [];
   const renames: { oldPath: string; newPath: string }[] = [];
+  const files = new Map<string, Uint8Array<ArrayBuffer>>();
   const vault: VaultOps = {
     write: async (path, bytes) => {
       // Simulate Obsidian: writing fires a vault modify event, which must be suppressed.
@@ -87,6 +100,8 @@ function makeRig(): Rig {
       watcher.track({ kind: "rename", path: newPath, oldPath });
       renames.push({ oldPath, newPath });
     },
+    readFile: async (path) => files.get(path) ?? null,
+    stat: async (path) => (files.has(path) ? "file" : null),
   };
   const watcher = new VaultWatcher({
     readBytes: async () => null,
@@ -99,8 +114,9 @@ function makeRig(): Rig {
       conn = new FakeConnection(handlers);
       return conn;
     },
+    ...options,
   });
-  return { state, queue, watcher, vault, conn: conn!, engine, writes, removes, renames };
+  return { state, queue, watcher, vault, conn: conn!, engine, writes, removes, renames, files };
 }
 
 describe("SyncEngine", () => {
@@ -194,6 +210,7 @@ describe("SyncEngine", () => {
 
   it("applies a remote delete without echo", async () => {
     const rig = makeRig();
+    rig.files.set("bye.md", new Uint8Array(new TextEncoder().encode("x").buffer as ArrayBuffer));
     const remote: Change = change({ operationId: "remote-del", revision: 5, path: "bye.md", operation: "delete" });
     rig.conn.handlers.onRemoteChange(remote);
     await new Promise((r) => setTimeout(r, 10));
@@ -202,8 +219,19 @@ describe("SyncEngine", () => {
     expect(rig.conn.acks).toEqual([5]);
   });
 
+  it("applies a remote delete without echo when the target is already gone", async () => {
+    const rig = makeRig();
+    const remote: Change = change({ operationId: "remote-del", revision: 5, path: "bye.md", operation: "delete" });
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    // idempotent: nothing to remove, but the op still ACKs and advances
+    expect(rig.removes).toEqual([]);
+    expect(rig.conn.acks).toEqual([5]);
+  });
+
   it("applies a remote rename without echo", async () => {
     const rig = makeRig();
+    rig.files.set("old.md", new Uint8Array(new TextEncoder().encode("x").buffer as ArrayBuffer));
     const remote: Change = change({ operationId: "remote-rn", revision: 6, path: "new.md", oldPath: "old.md", operation: "rename" });
     rig.conn.handlers.onRemoteChange(remote);
     await new Promise((r) => setTimeout(r, 10));
@@ -222,11 +250,16 @@ describe("SyncEngine", () => {
       operation: "create",
       payload: toBase64(new TextEncoder().encode("hello")),
     });
-    (rig.conn as unknown as FakeConnection & { pullOverride?: unknown }).pull = async () => ({
-      currentRevision: 7,
-      resyncRequired: false,
-      changes: [pulled],
-    });
+    let served = false;
+    (rig.conn as unknown as FakeConnection & { pullOverride?: unknown }).pull = async () => {
+      if (served) return { currentRevision: 7, resyncRequired: false, changes: [] };
+      served = true;
+      return {
+        currentRevision: 7,
+        resyncRequired: false,
+        changes: [pulled],
+      };
+    };
     await rig.engine.syncNow();
     await new Promise((r) => setTimeout(r, 10));
     expect(rig.writes.length).toBe(1);
@@ -236,7 +269,7 @@ describe("SyncEngine", () => {
     expect(rig.queue.size()).toBe(0);
   });
 
-  it("seeds local files with their real payload content", async () => {
+  it("seeds local files with their real content", async () => {
     const rig = makeRig();
     rig.engine["scanner"] = {
       listFiles: async () => [
@@ -252,7 +285,10 @@ describe("SyncEngine", () => {
     expect(rig.queue.size()).toBe(2);
     const notes = rig.queue.items.find((c) => c.path === "notes.md")!;
     expect(notes.operation).toBe("create");
-    expect(Array.from(fromBase64(notes.payload!))).toEqual([...new TextEncoder().encode("# hi")]);
+    expect(notes.content?.byteLength).toBe(4);
+    expect(notes.content?.hash).toBe(
+      await sha256Hex(new TextEncoder().encode("# hi")),
+    );
     const empty = rig.queue.items.find((c) => c.path === "empty.md")!;
     expect(empty.payload).toBe("");
     expect(rig.state.seeded).toBe(true);
@@ -327,7 +363,7 @@ describe("SyncEngine", () => {
         { path: "local-only.md", size: 100 },
         { path: "already-on-server.md", size: 200 },
         { path: ".obsidian/workspace", size: 50 },
-        { path: "big.bin", size: 5 * 1024 * 1024 },
+        { path: "big.bin", size: 20 * 1024 * 1024 },
       ],
     };
     await rig.state.markApplied("already-on-server.md");
@@ -355,6 +391,564 @@ describe("SyncEngine", () => {
     await Promise.all([p1, p2]);
     expect(rig.state.lastRevision).toBe(5);
     expect(rig.queue.size()).toBe(0);
+  });
+
+  it("HTTP cursor rule: accept does not advance; the pulled echo does", async () => {
+    const rig = makeRig();
+    rig.conn.advanceCursorOnAccept = false;
+    await rig.queue.enqueue(
+      change({ operationId: "op-http", path: "a.md", operation: "update", payload: toBase64(new TextEncoder().encode("v2")) }),
+    );
+    const synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.conn.sent.length).toBe(1);
+    rig.conn.handlers.onAccepted("op-http", 8);
+    await new Promise((r) => setTimeout(r, 10));
+    // The accept alone never moved the cursor; the queue emptied though.
+    expect(rig.queue.size()).toBe(0);
+    expect(rig.state.lastRevision).toBe(3);
+    // Next poll pulls back the pusher's own change and applies it: cursor moves.
+    const echo: Change = change({
+      operationId: "op-http",
+      revision: 8,
+      path: "a.md",
+      operation: "update",
+      baseRevision: 0,
+      payload: toBase64(new TextEncoder().encode("v2")),
+    });
+    let served = false;
+    (rig.conn as unknown as FakeConnection & { pullOverride?: unknown }).pull = async () => {
+      if (served) return { currentRevision: 8, resyncRequired: false, changes: [] };
+      served = true;
+      return { currentRevision: 8, resyncRequired: false, changes: [echo] };
+    };
+    const synced2 = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    await synced2;
+    expect(rig.state.lastRevision).toBe(8);
+    expect(rig.conn.acks).toContain(8);
+  });
+
+  it("refreshes a stale content descriptor and sends small files inline", async () => {
+    const rig = makeRig();
+    const bytes = new TextEncoder().encode("v1").buffer as ArrayBuffer;
+    rig.files.set("a.md", new Uint8Array(bytes));
+    await rig.queue.enqueue(
+      change({
+        operationId: "op-chunk",
+        path: "a.md",
+        operation: "create",
+        content: {
+          hash: await sha256Hex(new TextEncoder().encode("v1")),
+          byteLength: 2,
+          chunkCount: 1,
+        },
+      }),
+    );
+    // the file changed between capture and flush
+    rig.files.set("a.md", new Uint8Array(new TextEncoder().encode("v2").buffer as ArrayBuffer));
+    const synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.conn.sent.length).toBe(1);
+    // small files travel inline as base64 payloads, not as content uploads
+    expect(rig.conn.sent[0].content).toBeUndefined();
+    expect(new TextDecoder().decode(fromBase64(rig.conn.sent[0].payload!))).toBe("v2");
+    rig.conn.handlers.onAccepted("op-chunk", 4);
+    await synced;
+    expect(rig.queue.size()).toBe(0);
+  });
+
+  it("serves uploads from staged snapshots even when the live file is gone, then cleans up", async () => {
+    const staging = new MemoryStaging();
+    const rig = makeRig({ staging });
+    const small = new TextEncoder().encode("hello");
+    await staging.save("op-inline", small);
+    await rig.engine.enqueueLocal(
+      change({
+        operationId: "op-inline",
+        path: "s.md",
+        operation: "create",
+        content: {
+          hash: await sha256Hex(small),
+          byteLength: small.byteLength,
+          chunkCount: 1,
+        },
+      }),
+    );
+    // No live file exists; the snapshot alone must carry the upload.
+    const synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.conn.sent.length).toBe(1);
+    expect(rig.conn.sent[0].content).toBeUndefined();
+    expect(new TextDecoder().decode(fromBase64(rig.conn.sent[0].payload!))).toBe("hello");
+    rig.conn.handlers.onAccepted("op-inline", 4);
+    await synced;
+    expect(rig.queue.size()).toBe(0);
+    expect(await staging.list()).toEqual([]);
+  });
+
+  it("uploads staged snapshots over the 1 MiB inline cap via content references", async () => {
+    const staging = new MemoryStaging();
+    const rig = makeRig({ staging });
+    const big = new Uint8Array(1024 * 1024 + 100).fill(0x41);
+    await staging.save("op-big", big);
+    await rig.engine.enqueueLocal(
+      change({
+        operationId: "op-big",
+        path: "b.bin",
+        operation: "create",
+        content: {
+          hash: await sha256Hex(big),
+          byteLength: big.byteLength,
+          chunkCount: 1,
+        },
+      }),
+    );
+    const synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.conn.sent.length).toBe(1);
+    expect(rig.conn.sent[0].content?.byteLength).toBe(big.byteLength);
+    expect(rig.conn.sent[0].payload).toBeUndefined();
+    rig.conn.handlers.onAccepted("op-big", 5);
+    await synced;
+    expect(rig.queue.size()).toBe(0);
+    expect(await staging.list()).toEqual([]);
+  });
+
+  it("reconciles staged snapshots orphaned by a crash between staging and enqueueing", async () => {
+    const staging = new MemoryStaging();
+    const rig = makeRig({ staging });
+    await staging.save("orphan", new TextEncoder().encode("x"));
+    const kept = new TextEncoder().encode("y");
+    await staging.save("kept", kept);
+    await rig.engine.enqueueLocal(
+      change({
+        operationId: "kept",
+        path: "k.md",
+        operation: "create",
+        content: {
+          hash: await sha256Hex(kept),
+          byteLength: 1,
+          chunkCount: 1,
+        },
+      }),
+    );
+    await rig.engine["reconcileStaging"]();
+    expect(await staging.list()).toEqual(["kept"]);
+  });
+
+  it("drops a queued upload when the file vanished before flush", async () => {
+    const rig = makeRig();
+    await rig.queue.enqueue(
+      change({
+        operationId: "op-ghost",
+        path: "ghost.md",
+        operation: "create",
+        content: { hash: "x", byteLength: 1, chunkCount: 1 },
+      }),
+    );
+    const synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.conn.sent.length).toBe(0);
+    expect(rig.queue.size()).toBe(0);
+    await synced;
+  });
+
+  it("applies a chunked remote change via fetchContent, verifying the hash", async () => {
+    const rig = makeRig();
+    rig.engine.start();
+    const payload = new TextEncoder().encode("# chunked");
+    rig.conn.contentByPath.set(
+      "chunk.md",
+      new Uint8Array(payload.buffer as ArrayBuffer),
+    );
+    const remote: Change = change({
+      operationId: "remote-chunk",
+      revision: 9,
+      path: "chunk.md",
+      operation: "create",
+      baseRevision: 0,
+      content: {
+        hash: await sha256Hex(new TextEncoder().encode("# chunked")),
+        byteLength: payload.byteLength,
+        chunkCount: 1,
+      },
+    });
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.writes.length).toBe(1);
+    expect(rig.writes[0].path).toBe("chunk.md");
+    expect(new TextDecoder().decode(rig.writes[0].bytes)).toBe("# chunked");
+    expect(rig.conn.acks).toEqual([9]);
+    expect(rig.state.lastRevision).toBe(9);
+  });
+
+  it("pauses when chunked content cannot be fetched or fails verification", async () => {
+    const rig = makeRig();
+    rig.engine.start();
+    const remote: Change = change({
+      operationId: "remote-bad",
+      revision: 9,
+      path: "chunk.md",
+      operation: "create",
+      baseRevision: 0,
+      content: { hash: "deadbeef", byteLength: 7, chunkCount: 1 },
+    });
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.engine.status).toBe("paused");
+    expect(rig.state.lastRevision).toBe(3);
+    expect(rig.conn.acks).toEqual([]);
+  });
+
+  it("converges: pulls in batches until both streams are consumed", async () => {
+    const rig = makeRig();
+    let pulls = 0;
+    (rig.conn as unknown as FakeConnection & { pullOverride?: unknown }).pull = async () => {
+      pulls += 1;
+      if (pulls === 1) {
+        return {
+          currentRevision: 4,
+          resyncRequired: false,
+          changes: [
+            change({ operationId: "r1", revision: 4, path: "p1.md", operation: "create", payload: toBase64(new TextEncoder().encode("a")) }),
+          ],
+        };
+      }
+      return { currentRevision: 4, resyncRequired: false, changes: [] };
+    };
+    const synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    await synced;
+    expect(pulls).toBeGreaterThanOrEqual(2);
+    expect(rig.writes.length).toBe(1);
+    expect(rig.state.lastRevision).toBe(4);
+  });
+
+  it("enters conflict status and keeps the queue when the server demands a resync", async () => {
+    const rig = makeRig();
+    await rig.queue.enqueue(change({ operationId: "op-1", path: "a.md" }));
+    (rig.conn as unknown as FakeConnection & { pullOverride?: unknown }).pull = async () => ({
+      currentRevision: 0,
+      resyncRequired: true,
+      changes: [],
+    });
+    const synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    await synced;
+    expect(rig.engine.status).toBe("conflict");
+    expect(rig.queue.size()).toBe(1);
+  });
+
+  it("wires onResyncRequired from the transport into the same conflict state", async () => {
+    const rig = makeRig();
+    await rig.queue.enqueue(change({ operationId: "op-1", path: "a.md" }));
+    const synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    rig.conn.handlers.onResyncRequired?.("retention window exceeded");
+    await new Promise((r) => setTimeout(r, 10));
+    await synced;
+    expect(rig.engine.status).toBe("conflict");
+    expect(rig.queue.size()).toBe(1);
+  });
+
+  it("re-applies a redelivered remote change exactly once (journal idempotency)", async () => {
+    const rig = makeRig();
+    const remote = change({
+      operationId: "remote-dupe",
+      revision: 4,
+      path: "a.md",
+      operation: "create",
+      payload: toBase64(new TextEncoder().encode("once")),
+    });
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.writes.length).toBe(1);
+    expect(rig.state.journal.some((e) => e.operationId === "remote-dupe")).toBe(true);
+    // lost-ACK redelivery
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.writes.length).toBe(1);
+    // same-revision redelivery does not re-ACK (cursor gating)
+    expect(rig.conn.acks).toEqual([4]);
+  });
+
+  it("treats a rename whose source is gone but target exists as already done", async () => {
+    const rig = makeRig();
+    rig.files.set("new.md", new Uint8Array(new TextEncoder().encode("x").buffer as ArrayBuffer));
+    const remote = change({
+      operationId: "remote-rn-2",
+      revision: 6,
+      path: "new.md",
+      oldPath: "old.md",
+      operation: "rename",
+    });
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.renames).toEqual([]);
+    expect(rig.state.journal.some((e) => e.operationId === "remote-rn-2")).toBe(true);
+    // the journaled op is proven on any later redelivery
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.renames).toEqual([]);
+    // same-revision redelivery does not re-ACK (cursor gating)
+    expect(rig.conn.acks).toEqual([6]);
+  });
+
+  it("pauses on an ambiguous rename (both source and target missing), never ACKing", async () => {
+    const rig = makeRig();
+    const remote = change({
+      operationId: "remote-rn-3",
+      revision: 6,
+      path: "new.md",
+      oldPath: "old.md",
+      operation: "rename",
+    });
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.engine.status).toBe("paused");
+    expect(rig.engine.isPaused).toBe(true);
+    expect(rig.conn.acks).toEqual([]);
+    expect(rig.state.lastRevision).toBe(3);
+  });
+
+  it("preserves an occupied rename target as a queued conflict copy", async () => {
+    const rig = makeRig();
+    rig.files.set("src.md", new Uint8Array(new TextEncoder().encode("src").buffer as ArrayBuffer));
+    rig.files.set("dst.md", new Uint8Array(new TextEncoder().encode("local dst").buffer as ArrayBuffer));
+    const remote = change({
+      operationId: "remote-rn-4",
+      revision: 7,
+      path: "dst.md",
+      oldPath: "src.md",
+      operation: "rename",
+    });
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.renames.length).toBe(2);
+    expect(rig.renames[0].oldPath).toBe("dst.md");
+    expect(rig.renames[0].newPath).toMatch(/dst \(conflict-local-\d+\)\.md/);
+    expect(rig.renames[1]).toEqual({ oldPath: "src.md", newPath: "dst.md" });
+    // the preserved copy is queued for upload with its content descriptor
+    expect(rig.queue.size()).toBe(1);
+    const copy = rig.queue.items[0];
+    expect(copy.path).toMatch(/dst \(conflict-local-\d+\)\.md/);
+    expect(copy.operation).toBe("create");
+    expect(rig.conn.acks).toEqual([7]);
+  });
+
+  it("renames case-only files through a two-step temp name", async () => {
+    const rig = makeRig();
+    rig.files.set("Readme.md", new Uint8Array(new TextEncoder().encode("x").buffer as ArrayBuffer));
+    const remote = change({
+      operationId: "remote-case",
+      revision: 8,
+      path: "readme.md",
+      oldPath: "Readme.md",
+      operation: "rename",
+    });
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.renames.length).toBe(2);
+    expect(rig.renames[0].oldPath).toBe("Readme.md");
+    expect(rig.renames[0].newPath).toMatch(/^\.Readme-syncvault-[0-9a-f]{8}\.md$/);
+    expect(rig.renames[1]).toEqual({ oldPath: rig.renames[0].newPath, newPath: "readme.md" });
+    expect(rig.conn.acks).toEqual([8]);
+  });
+
+  it("backs a file up and queues it when a folder is needed in its place", async () => {
+    const rig = makeRig();
+    rig.files.set("dir", new Uint8Array(new TextEncoder().encode("oops").buffer as ArrayBuffer));
+    const remote = change({
+      operationId: "remote-folder",
+      revision: 9,
+      path: "dir/note.md",
+      operation: "create",
+      payload: toBase64(new TextEncoder().encode("nested")),
+    });
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.renames.length).toBe(1);
+    expect(rig.renames[0].oldPath).toBe("dir");
+    expect(rig.renames[0].newPath).toMatch(/dir \(conflict-local-\d+\)/);
+    expect(rig.writes.length).toBe(1);
+    expect(rig.writes[0].path).toBe("dir/note.md");
+    const copy = rig.queue.items.find((c) => c.path.includes("conflict-local"))!;
+    expect(copy.operation).toBe("create");
+    expect(rig.conn.acks).toEqual([9]);
+  });
+
+  it("migrates legacy inline payloads into staged snapshots on start", async () => {
+    const staging = new MemoryStaging();
+    const rig = makeRig({ staging });
+    await rig.queue.enqueue(
+      change({
+        operationId: "op-legacy-1",
+        path: "legacy.md",
+        operation: "create",
+        payload: toBase64(new TextEncoder().encode("legacy bytes")),
+      }),
+    );
+    await rig.queue.enqueue(
+      change({
+        operationId: "op-legacy-0",
+        path: "empty.md",
+        operation: "create",
+        payload: "",
+      }),
+    );
+    await rig.engine["migrateLegacyPayloads"]();
+    const migrated = rig.queue.items.find((c) => c.operationId === "op-legacy-1")!;
+    expect(migrated.payload).toBeUndefined();
+    expect(migrated.stagedFile).toBe("op-legacy-1");
+    expect(migrated.content?.byteLength).toBe(12);
+    expect(new TextDecoder().decode((await staging.load("op-legacy-1"))!)).toBe("legacy bytes");
+    // zero-byte files keep their marker payload
+    const empty = rig.queue.items.find((c) => c.operationId === "op-legacy-0")!;
+    expect(empty.payload).toBe("");
+    expect(empty.stagedFile).toBeUndefined();
+  });
+
+  it("serves legacy-migrated items as inline payloads on flush", async () => {
+    const staging = new MemoryStaging();
+    const rig = makeRig({ staging });
+    await rig.queue.enqueue(
+      change({
+        operationId: "op-legacy-2",
+        path: "legacy2.md",
+        operation: "create",
+        payload: toBase64(new TextEncoder().encode("still here")),
+      }),
+    );
+    const synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.conn.sent.length).toBe(1);
+    expect(new TextDecoder().decode(fromBase64(rig.conn.sent[0].payload!))).toBe("still here");
+    rig.conn.handlers.onAccepted("op-legacy-2", 10);
+    await synced;
+    expect(await staging.list()).toEqual([]);
+  });
+
+  it("pauses only after three consecutive auth failures, then recovers via authRecovered()", async () => {
+    const { conn, engine } = makeRig();
+    conn.handlers.onAuthFailure?.("bad token");
+    expect(engine.isPaused).toBe(false);
+    expect(engine.status).not.toBe("paused");
+    conn.handlers.onAuthFailure?.("bad token");
+    expect(engine.isPaused).toBe(false);
+    // third strike pauses once
+    conn.handlers.onAuthFailure?.("bad token");
+    expect(engine.isPaused).toBe(true);
+    expect(engine.status).toBe("paused");
+    // a successful reconnect (transport re-linked, like the real UI flow)
+    // resets the strike counter and resumes polling
+    conn.connected = true;
+    await engine.authRecovered();
+    expect(engine.isPaused).toBe(false);
+    expect(engine.status).toBe("synced");
+  });
+
+  it("reconnect rotates the device token and preserves cursor and queue", async () => {
+    const state = makeConfiguredState();
+    const queue = new ChangeQueue(state);
+    await queue.enqueue(
+      change({ operationId: "op-reconn", path: "kept.md", operation: "create", payload: "aGk=" }),
+    );
+    const client = {
+      registerDevice: async () => ({ deviceToken: "rotated-token" }),
+    } as unknown as SyncClient;
+    const auth = new AuthManager(state, client);
+    await auth.reconnect("correct horse");
+    expect(state.deviceToken).toBe("rotated-token");
+    expect(state.lastRevision).toBe(3);
+    expect(state.pendingChanges).toHaveLength(1);
+    expect(state.pendingChanges[0].operationId).toBe("op-reconn");
+  });
+
+  it("enqueues visual appearance files inline, staged, or as zero-byte payloads", async () => {
+    const staging = new MemoryStaging();
+    const rig = makeRig({ staging });
+    const small = new TextEncoder().encode('{"cssTheme":"Atom"}') as Uint8Array<ArrayBuffer>;
+    const big = new Uint8Array<ArrayBuffer>(2 * 1024 * 1024).fill(7);
+
+    await rig.engine.enqueueVisualChange("syncvault-visual/appearance.json", small);
+    await rig.engine.enqueueVisualChange("syncvault-visual/themes/Big/theme.css", big);
+    await rig.engine.enqueueVisualChange("syncvault-visual/empty.md", new Uint8Array<ArrayBuffer>(0));
+
+    expect(rig.queue.items.map((c) => c.path)).toEqual([
+      "syncvault-visual/appearance.json",
+      "syncvault-visual/themes/Big/theme.css",
+      "syncvault-visual/empty.md",
+    ]);
+    const smallItem = rig.queue.items.find((c) => c.path.endsWith("appearance.json"))!;
+    expect(typeof smallItem.payload).toBe("string");
+    const bigItem = rig.queue.items.find((c) => c.path.includes("theme.css"))!;
+    expect(bigItem.content?.byteLength).toBe(big.byteLength);
+    expect(bigItem.stagedFile).toBe(bigItem.operationId);
+    const empty = rig.queue.items.find((c) => c.path.endsWith("empty.md"))!;
+    expect(empty.payload).toBe("");
+  });
+
+  it("join mode preserves divergent local files as conflict copies", async () => {
+    const rig = makeRig();
+    rig.engine.enterJoinMode();
+    const local = new TextEncoder().encode("local edit");
+    const remoteBytes = new TextEncoder().encode("remote baseline");
+    rig.files.set("kept.md", new Uint8Array(local.buffer as ArrayBuffer));
+    const remote: Change = change({
+      operationId: "join-op",
+      revision: 7,
+      path: "kept.md",
+      operation: "update",
+      baseRevision: 0,
+      payload: toBase64(remoteBytes),
+    });
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    // target overwritten with the baseline
+    const target = rig.writes.find((w) => w.path === "kept.md")!;
+    expect(new TextDecoder().decode(target.bytes)).toBe("remote baseline");
+    // local bytes preserved under a conflict copy, queued for upload
+    const backup = rig.writes.find((w) => w.path !== "kept.md")!;
+    expect(backup.path).toMatch(/^kept \(conflict-local-\d{12}\)\.md$/);
+    expect(new TextDecoder().decode(backup.bytes)).toBe("local edit");
+    expect(rig.queue.items.some((c) => c.path === backup.path)).toBe(true);
+    expect(rig.conn.acks).toEqual([7]);
+  });
+
+  it("join mode leaves identical local files untouched", async () => {
+    const rig = makeRig();
+    rig.engine.enterJoinMode();
+    const bytes = new TextEncoder().encode("# same");
+    rig.files.set("same.md", new Uint8Array(bytes.buffer as ArrayBuffer));
+    const remote: Change = change({
+      operationId: "join-2",
+      revision: 7,
+      path: "same.md",
+      operation: "update",
+      baseRevision: 0,
+      payload: toBase64(bytes),
+    });
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.writes.length).toBe(1);
+    expect(rig.writes[0].path).toBe("same.md");
+    expect(rig.queue.size()).toBe(0);
+  });
+
+  it("counts syncable files for recovery safety checks", async () => {
+    const rig = makeRig({
+      scanner: {
+        listFiles: async () => [
+          { path: "a.md", size: 10 },
+          { path: ".obsidian/appearance.json", size: 5 },
+          { path: "big.bin", size: 30 * 1024 * 1024 },
+          { path: "empty.md", size: 0 },
+        ],
+        readBytes: async () => new ArrayBuffer(0),
+      },
+    });
+    expect(await rig.engine.countSyncableFiles()).toBe(1);
   });
 });
 

@@ -44,6 +44,13 @@ function change(over: Partial<Change> = {}): Change {
   };
 }
 
+function apiError(status: number, code: string, message: string): Error {
+  const err = new Error(message) as Error & { status?: number; code?: string };
+  err.status = status;
+  err.code = code;
+  return err;
+}
+
 describe("HttpConnection", () => {
   it("pulls changes after the cursor and reports resync", async () => {
     const seen: number[] = [];
@@ -99,5 +106,55 @@ describe("HttpConnection", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(errors.length).toBe(1);
     expect(errors[0]).toContain("network down");
+  });
+
+  it("maps a 460 push to onResyncRequired instead of dropping the change", async () => {
+    const resync: string[] = [];
+    const rejected: string[] = [];
+    const client = makeClient({
+      pushChange: async () => {
+        throw apiError(460, "RESYNC_REQUIRED", "vault history was reset; resync required");
+      },
+    });
+    const conn = new HttpConnection(makeState(), client, {
+      onResyncRequired: () => resync.push("resync"),
+      onRejected: (id) => rejected.push(id),
+    } as ConnectionCallbacks);
+    conn.sendChange(change());
+    await new Promise((r) => setTimeout(r, 20));
+    expect(resync.length).toBe(1);
+    expect(rejected.length).toBe(0);
+  });
+
+  it("reports resyncRequired from the pull response", async () => {
+    const resync: number[] = [];
+    const client = makeClient({
+      pullChanges: async () => ({
+        currentRevision: 7,
+        minRetainedRevision: 2,
+        resyncRequired: true,
+        changes: [],
+      }),
+    });
+    const conn = new HttpConnection(makeState(), client, {
+      onResyncRequired: () => resync.push(1),
+    } as ConnectionCallbacks);
+    const result = await conn.pull(5);
+    expect(result.resyncRequired).toBe(true);
+    expect(resync.length).toBe(1);
+  });
+
+  it("maps a 426 pull to onError and rethrows", async () => {
+    const errors: string[] = [];
+    const client = makeClient({
+      pullChanges: async () => {
+        throw apiError(426, "CLIENT_UPGRADE_REQUIRED", "this vault contains chunked content; update SyncVault");
+      },
+    });
+    const conn = new HttpConnection(makeState(), client, {
+      onError: (m) => errors.push(m),
+    } as ConnectionCallbacks);
+    await expect(conn.pull(5)).rejects.toThrow();
+    expect(errors.length).toBe(1);
   });
 });
