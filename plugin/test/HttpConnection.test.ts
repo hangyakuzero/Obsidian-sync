@@ -157,4 +157,56 @@ describe("HttpConnection", () => {
     await expect(conn.pull(5)).rejects.toThrow();
     expect(errors.length).toBe(1);
   });
+
+  it("notifies onAuthed after a successful pull and push accept", async () => {
+    let authed = 0;
+    const client = makeClient({
+      downloadContent: async () => new Uint8Array([1, 2, 3]),
+    });
+    const conn = new HttpConnection(makeState(), client, {
+      onAuthed: () => (authed += 1),
+      onConflict: () => undefined,
+    } as ConnectionCallbacks);
+    await conn.pull(5);
+    conn.sendChange(change());
+    await new Promise((r) => setTimeout(r, 20));
+    // pull + push accept = 2 authenticated successes (conflict would also count)
+    expect(authed).toBe(2);
+  });
+
+  it("classifies a content-download 401 as an auth failure, not corrupt content", async () => {
+    const authErrors: string[] = [];
+    const errors: string[] = [];
+    const client = makeClient({
+      downloadContent: async () => {
+        throw apiError(401, "UNAUTHORIZED", "invalid token");
+      },
+    });
+    const conn = new HttpConnection(makeState(), client, {
+      onAuthFailure: (m) => authErrors.push(m),
+      onError: (m) => errors.push(m),
+    } as ConnectionCallbacks);
+    const result = await conn.fetchContent(change({ content: { hash: "a".repeat(64), byteLength: 1, chunkCount: 1 }, revision: 9 }));
+    expect(result).toBeNull();
+    expect(authErrors.length).toBe(1);
+    expect(errors.length).toBe(0);
+  });
+
+  it("does not classify a non-401 content-download failure as an auth failure", async () => {
+    const authErrors: string[] = [];
+    const errors: string[] = [];
+    const client = makeClient({
+      downloadContent: async () => {
+        throw new Error("connection reset");
+      },
+    });
+    const conn = new HttpConnection(makeState(), client, {
+      onAuthFailure: () => authErrors.push("auth"),
+      onError: (m) => errors.push(m),
+    } as ConnectionCallbacks);
+    const result = await conn.fetchContent(change({ content: { hash: "b".repeat(64), byteLength: 1, chunkCount: 1 }, revision: 9 }));
+    expect(result).toBeNull();
+    expect(authErrors.length).toBe(0);
+    expect(errors.length).toBe(1);
+  });
 });

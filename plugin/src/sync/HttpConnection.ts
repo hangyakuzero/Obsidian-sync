@@ -61,6 +61,7 @@ export class HttpConnection implements Connection {
       if (r.resyncRequired) {
         this.callbacks.onResyncRequired?.();
       }
+      this.callbacks.onAuthed?.();
       return { currentRevision: r.currentRevision, changes: r.changes, resyncRequired: r.resyncRequired };
     } catch (e) {
       if (isApiError(e) && e.status === 401) {
@@ -101,6 +102,12 @@ export class HttpConnection implements Connection {
         change.content,
       );
     } catch (e) {
+      // A 401 here is an auth problem, not corrupt content: it must feed the
+      // retry/auth path, not look like an apply failure.
+      if (isApiError(e) && e.status === 401) {
+        this.callbacks.onAuthFailure?.("authentication expired; reconnect the vault");
+        return null;
+      }
       this.callbacks.onError?.(`content download failed: ${(e as Error).message}`);
       return null;
     }
@@ -120,6 +127,7 @@ export class HttpConnection implements Connection {
         this.callbacks.onRetry?.(change.operationId, "content upload failed");
         return;
       }
+      this.callbacks.onAuthed?.();
       if (result.status === "accepted") {
         this.callbacks.onAccepted(change.operationId, result.revision);
       } else {

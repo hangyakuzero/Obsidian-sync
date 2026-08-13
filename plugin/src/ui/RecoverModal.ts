@@ -39,6 +39,7 @@ export class RecoverModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
+    contentEl.addClass("syncvault-modal");
     const reset = this.mode === "reset";
     contentEl.createEl("h2", { text: "Recover sync" });
     contentEl.createEl("p", {

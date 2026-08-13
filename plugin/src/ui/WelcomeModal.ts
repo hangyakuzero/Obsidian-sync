@@ -15,6 +15,7 @@ export class WelcomeModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
+    contentEl.addClass("syncvault-modal");
     contentEl.createEl("h2", { text: "Welcome to SyncVault" });
     contentEl.createEl("p", { text: "Synchronize this vault between your devices." });
 
@@ -56,6 +57,7 @@ class NewUserModal extends Modal {
   async onOpen(): Promise<void> {
     const { contentEl } = this;
     contentEl.empty();
+    contentEl.addClass("syncvault-modal");
     contentEl.createEl("h2", { text: "Create account" });
     if (this.deviceName === "Desktop") {
       this.deviceName = "Desktop";
@@ -106,6 +108,7 @@ class ExistingUserModal extends Modal {
   private deviceName = "";
   private vaults: { vaultId: string; name: string }[] = [];
   private selectedVaultId = "";
+  private pickerRendered = false;
 
   constructor(app: App, private auth: AuthManager, private onDone: () => void) {
     super(app);
@@ -116,6 +119,7 @@ class ExistingUserModal extends Modal {
   async onOpen(): Promise<void> {
     const { contentEl } = this;
     contentEl.empty();
+    contentEl.addClass("syncvault-modal");
     contentEl.createEl("h2", { text: "Sign in" });
 
     new Setting(contentEl).setName("Account ID").addText((t) => {
@@ -146,14 +150,17 @@ class ExistingUserModal extends Modal {
           b.setDisabled(false);
           return;
         }
-        this.renderVaultPicker();
         this.selectedVaultId = this.vaults[0].vaultId;
-        b.setDisabled(false);
+        this.renderVaultPicker();
+        // Keep the button disabled: a second successful sign-in must not
+        // append a duplicate vault picker to the modal.
       }),
     );
   }
 
   private renderVaultPicker(): void {
+    if (this.pickerRendered) return;
+    this.pickerRendered = true;
     const { contentEl } = this;
     const setting = new Setting(contentEl).setName("Vault to sync");
     setting.addDropdown((d) => {

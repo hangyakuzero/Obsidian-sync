@@ -24,6 +24,12 @@ const DEBOUNCE_MS = 800;
 // their follow-up events, and short enough that an immediately subsequent
 // local edit is still captured.
 const EXPECT_TTL_MS = 5_000;
+// Obsidian can fire `create`/`modify` before the adapter can read the bytes
+// (UI-created notes, slow disks, large vaults). A capture must never be
+// dropped because of a transient read failure: retry a few times, then give
+// up — a later modify event will recapture the file if it is really edited.
+const READ_ATTEMPTS = 3;
+const READ_RETRY_MS = 300;
 
 type ExpectedKind = "content" | "delete" | "rename";
 
@@ -234,14 +240,10 @@ export class VaultWatcher {
       await this.ctx.onChange(change);
       return;
     }
-    const bytes = await this.ctx.readBytes(ev.path);
+    const bytes = await this.readWithRetry(ev.path);
     if (bytes === null) return;
     if (bytes.byteLength > MAX_FILE_BYTES) {
       this.ctx.onTooLarge?.(ev.path, bytes.byteLength);
-      return;
-    }
-    if (bytes.byteLength === 0) {
-      // Obsidian never saves empty files; skip rather than hash nothing.
       return;
     }
     const data = new Uint8Array(bytes);
@@ -254,6 +256,23 @@ export class VaultWatcher {
       }
       // The bytes differ from what the engine wrote: a real local edit.
       this.expected.delete(ev.path);
+    }
+    if (data.byteLength === 0) {
+      // Empty files are valid (they travel as empty base64 payloads); a
+      // zero-byte read after the expectation check above is a genuine
+      // empty-file capture, not a race.
+      const change: Change = {
+        operationId: this.newOperationId(),
+        revision: 0,
+        deviceId: "",
+        path: normalizePath(ev.path),
+        operation: ev.kind === "modify" ? "update" : "create",
+        baseRevision: this.ctx.getBaseRevision(),
+        timestamp: Date.now(),
+        payload: "",
+      };
+      await this.ctx.onChange(change);
+      return;
     }
     const operationId = this.newOperationId();
     if (this.ctx.stage) await this.ctx.stage(operationId, data);
@@ -272,6 +291,30 @@ export class VaultWatcher {
       },
     };
     await this.ctx.onChange(change);
+  }
+
+  /**
+   * Reads capture bytes with bounded retries. `null` (or a failed read that
+   * never recovers) means the event is dropped — a genuine deletion returns
+   * null from the adapter, and any later edit re-triggers a capture.
+   */
+  private async readWithRetry(path: string): Promise<ArrayBuffer | null> {
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < READ_ATTEMPTS; attempt++) {
+      try {
+        return await this.ctx.readBytes(path);
+      } catch (e) {
+        lastError = e;
+        if (attempt < READ_ATTEMPTS - 1) {
+          await new Promise((resolve) => setTimeout(resolve, READ_RETRY_MS));
+        }
+      }
+    }
+    console.warn(
+      `SyncVault: dropped capture of "${path}" after ${READ_ATTEMPTS} failed reads`,
+      lastError,
+    );
+    return null;
   }
 
   private keyOf(ev: NormalizedEvent): string {

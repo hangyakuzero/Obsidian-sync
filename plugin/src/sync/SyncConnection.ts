@@ -40,6 +40,9 @@ export interface ConnectionCallbacks {
   onConflict(opts: { operationId: string; path: string; conflictPath?: string; serverRevision: number }): void;
   onRejected?(operationId: string, code: string, message: string): void;
   onAuthFailure?(message: string): void;
+  /** Any authenticated success (HTTP pull/push or WS welcome) resets the
+   * consecutive-auth-failure counter so three separated 401s never pause. */
+  onAuthed?(): void;
   onRetry?(operationId: string, message: string): void;
   onResyncRequired?(message?: string): void;
   onError(message: string): void;
@@ -99,7 +102,12 @@ export class SyncConnection implements Connection {
         });
       };
       ws.onmessage = (event) => this.dispatch(event);
-      ws.onclose = (event) => this.handleClose(event);
+      ws.onclose = (event) => {
+        // A stale socket closing after a reconnect must never take down the
+        // current connection.
+        if (ws !== this.ws) return;
+        this.handleClose(event);
+      };
       ws.onerror = () => {
         // onclose follows; nothing to do here
       };
@@ -225,6 +233,7 @@ export class SyncConnection implements Connection {
     switch (msg.type) {
       case "welcome":
         this.setStatus("open");
+        this.callbacks.onAuthed?.();
         this.chain(() => this.callbacks.onWelcome(msg.serverRevision, msg.resyncRequired));
         break;
       case "change":

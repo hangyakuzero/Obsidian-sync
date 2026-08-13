@@ -70,11 +70,12 @@ export default class SyncVaultPlugin extends Plugin {
     readBytes: async (path) => {
       const vr = VisualSync.relPath(path);
       const real = vr !== null ? configResolve(this.app.vault.configDir, vr) : path;
-      try {
-        return await this.app.vault.adapter.readBinary(real);
-      } catch {
-        return null;
-      }
+      // A missing file is a deletion (null). A failed read of an existing
+      // file throws so the watcher can retry instead of dropping the capture.
+      const st = await this.app.vault.adapter.stat(real).catch(() => null);
+      if (st === null) return null;
+      if (st.type === "folder") return null;
+      return await this.app.vault.adapter.readBinary(real);
     },
     getBaseRevision: () => this.state.lastRevision,
     stage: (operationId, bytes) => this.staging.save(operationId, bytes),

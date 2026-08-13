@@ -316,26 +316,33 @@ describe("SyncEngine", () => {
     expect(rig.queue.size()).toBe(2);
   });
 
-  it("pauses sync when a remote change cannot be applied", async () => {
-    const rig = makeRig();
+  it("pauses sync only after repeated failures to apply a remote change", async () => {
+    const rig = makeRig({ applyStrikeWindowMs: 10 });
     rig.vault.write = async () => {
       throw new Error("disk full");
     };
-    rig.conn.handlers.onRemoteChange(
-      change({
-        operationId: "remote-broken",
-        revision: 4,
-        path: "x.md",
-        operation: "create",
-        payload: toBase64(new TextEncoder().encode("hi")),
-      }),
-    );
+    const remote = change({
+      operationId: "remote-broken",
+      revision: 4,
+      path: "x.md",
+      operation: "create",
+      payload: toBase64(new TextEncoder().encode("hi")),
+    });
+    // the first failure retries instead of destroying sync
+    rig.conn.handlers.onRemoteChange(remote);
     await new Promise((r) => setTimeout(r, 10));
-    expect(rig.engine.status).toBe("paused");
-    expect(rig.engine.isPaused).toBe(true);
+    expect(rig.engine.status).toBe("conflict");
+    expect(rig.engine.isPaused).toBe(false);
     // never ACK an unapplied change
     expect(rig.state.lastRevision).toBe(3);
     expect(rig.conn.acks).toEqual([]);
+    // three spaced failures pause once with a notice
+    for (let i = 0; i < 2; i++) {
+      rig.conn.handlers.onRemoteChange(remote);
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    expect(rig.engine.isPaused).toBe(true);
+    expect(rig.engine.status).toBe("paused");
     // resume clears the pause and resumes polling
     await rig.engine.resume();
     expect(rig.engine.isPaused).toBe(false);
@@ -583,9 +590,9 @@ describe("SyncEngine", () => {
     expect(rig.state.lastRevision).toBe(9);
   });
 
-  it("pauses when chunked content cannot be fetched or fails verification", async () => {
-    const rig = makeRig();
-    rig.engine.start();
+  it("pauses after repeated failures when chunked content cannot be fetched", async () => {
+    const rig = makeRig({ applyStrikeWindowMs: 10 });
+    await rig.engine.start();
     const remote: Change = change({
       operationId: "remote-bad",
       revision: 9,
@@ -594,8 +601,16 @@ describe("SyncEngine", () => {
       baseRevision: 0,
       content: { hash: "deadbeef", byteLength: 7, chunkCount: 1 },
     });
+    // a single fetch failure is retried, not fatal
     rig.conn.handlers.onRemoteChange(remote);
     await new Promise((r) => setTimeout(r, 10));
+    expect(rig.engine.status).toBe("conflict");
+    expect(rig.engine.isPaused).toBe(false);
+    // repeated failures pause once
+    for (let i = 0; i < 2; i++) {
+      rig.conn.handlers.onRemoteChange(remote);
+      await new Promise((r) => setTimeout(r, 15));
+    }
     expect(rig.engine.status).toBe("paused");
     expect(rig.state.lastRevision).toBe(3);
     expect(rig.conn.acks).toEqual([]);
@@ -695,8 +710,8 @@ describe("SyncEngine", () => {
     expect(rig.conn.acks).toEqual([6]);
   });
 
-  it("pauses on an ambiguous rename (both source and target missing), never ACKing", async () => {
-    const rig = makeRig();
+  it("pauses after repeated failures on an ambiguous rename, never ACKing", async () => {
+    const rig = makeRig({ applyStrikeWindowMs: 10 });
     const remote = change({
       operationId: "remote-rn-3",
       revision: 6,
@@ -704,8 +719,16 @@ describe("SyncEngine", () => {
       oldPath: "old.md",
       operation: "rename",
     });
+    // a single ambiguous rename retries instead of killing sync
     rig.conn.handlers.onRemoteChange(remote);
     await new Promise((r) => setTimeout(r, 10));
+    expect(rig.engine.status).toBe("conflict");
+    expect(rig.engine.isPaused).toBe(false);
+    // repeated failures pause once, never ACKing
+    for (let i = 0; i < 2; i++) {
+      rig.conn.handlers.onRemoteChange(remote);
+      await new Promise((r) => setTimeout(r, 15));
+    }
     expect(rig.engine.status).toBe("paused");
     expect(rig.engine.isPaused).toBe(true);
     expect(rig.conn.acks).toEqual([]);
@@ -865,6 +888,123 @@ describe("SyncEngine", () => {
     expect(state.pendingChanges[0].operationId).toBe("op-reconn");
   });
 
+  it("retries a transient apply failure instead of pausing, then recovers", async () => {
+    const rig = makeRig({ applyStrikeWindowMs: 10 });
+    let fail = true;
+    rig.vault.write = async (path, bytes) => {
+      if (fail) {
+        fail = false;
+        throw new Error("transient write error");
+      }
+      rig.watcher.track({ kind: "modify", path });
+      rig.writes.push({ path, bytes });
+    };
+    const remote = change({
+      operationId: "remote-retry",
+      revision: 4,
+      path: "r.md",
+      operation: "create",
+      baseRevision: 0,
+      payload: toBase64(new TextEncoder().encode("x")),
+    });
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    // first attempt fails: sync stays live (conflict status), cursor untouched
+    expect(rig.writes.length).toBe(0);
+    expect(rig.engine.status).toBe("conflict");
+    expect(rig.engine.isPaused).toBe(false);
+    expect(rig.state.lastRevision).toBe(3);
+    // the change is redelivered on the next pull and now succeeds
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.writes.length).toBe(1);
+    expect(rig.state.lastRevision).toBe(4);
+    expect(rig.conn.acks).toEqual([4]);
+  });
+
+  it("pauses only after three spaced apply failures", async () => {
+    const rig = makeRig({ applyStrikeWindowMs: 10 });
+    rig.vault.write = async () => {
+      throw new Error("disk full");
+    };
+    const remote = change({
+      operationId: "remote-stuck",
+      revision: 4,
+      path: "s.md",
+      operation: "create",
+      baseRevision: 0,
+      payload: toBase64(new TextEncoder().encode("x")),
+    });
+    for (let i = 0; i < 3; i++) {
+      rig.conn.handlers.onRemoteChange(remote);
+      await new Promise((r) => setTimeout(r, 15));
+      if (i < 2) {
+        expect(rig.engine.isPaused).toBe(false);
+      }
+    }
+    expect(rig.engine.isPaused).toBe(true);
+    expect(rig.engine.status).toBe("paused");
+    expect(rig.state.lastRevision).toBe(3);
+  });
+
+  it("counts rapid retries of the same failure as a single strike", async () => {
+    const rig = makeRig({ applyStrikeWindowMs: 5000 });
+    rig.vault.write = async () => {
+      throw new Error("flaky");
+    };
+    const remote = change({
+      operationId: "remote-flaky",
+      revision: 4,
+      path: "f.md",
+      operation: "create",
+      baseRevision: 0,
+      payload: toBase64(new TextEncoder().encode("x")),
+    });
+    for (let i = 0; i < 5; i++) {
+      rig.conn.handlers.onRemoteChange(remote);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(rig.engine.isPaused).toBe(false);
+  });
+
+  it("resets the auth strike counter on any authenticated success", async () => {
+    const rig = makeRig();
+    rig.conn.handlers.onAuthFailure?.("bad token");
+    rig.conn.handlers.onAuthFailure?.("bad token");
+    rig.conn.handlers.onAuthed?.();
+    rig.conn.handlers.onAuthFailure?.("bad token");
+    rig.conn.handlers.onAuthFailure?.("bad token");
+    // 2 failures, reset, 2 failures — never three consecutive
+    expect(rig.engine.isPaused).toBe(false);
+  });
+
+  it("a stop during an in-flight pull prevents the old run from applying", async () => {
+    const rig = makeRig();
+    let resolvePull!: (v: { currentRevision: number; changes: Change[]; resyncRequired: boolean }) => void;
+    (rig.conn as unknown as FakeConnection & { pullOverride?: unknown }).pull = () =>
+      new Promise((res) => {
+        resolvePull = res;
+      });
+    const remote = change({
+      operationId: "remote-late",
+      revision: 9,
+      path: "late.md",
+      operation: "create",
+      baseRevision: 0,
+      payload: toBase64(new TextEncoder().encode("x")),
+    });
+    const synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    rig.engine.stop();
+    resolvePull!({ currentRevision: 9, changes: [remote], resyncRequired: false });
+    await synced;
+    // the stale run must not touch the filesystem, cursor, queue or status
+    expect(rig.writes.length).toBe(0);
+    expect(rig.state.lastRevision).toBe(3);
+    expect(rig.queue.size()).toBe(0);
+    expect(rig.engine.status).toBe("idle");
+  });
+
   it("enqueues visual appearance files inline, staged, or as zero-byte payloads", async () => {
     const staging = new MemoryStaging();
     const rig = makeRig({ staging });
@@ -950,7 +1090,202 @@ describe("SyncEngine", () => {
     });
     expect(await rig.engine.countSyncableFiles()).toBe(1);
   });
+
+  it("two devices: a file created on A appears on B (capture → push → pull → apply)", async () => {
+    const server = new FakeServer();
+    const a = makeDevice(server, "dev-a", 0);
+    const b = makeDevice(server, "dev-b", 0);
+
+    // Device A: user creates a note. The watcher debounce captures it and the
+    // engine pushes it immediately (scheduleImmediateSync — no manual wait).
+    a.files.set("note.md", new TextEncoder().encode("# from A"));
+    a.watcher.track({ kind: "create", path: "note.md" });
+    await a.watcher.flush();
+    await new Promise((r) => setTimeout(r, 80)); // immediate-sync kick
+    expect(server.changes).toHaveLength(1);
+    expect(a.queue.size()).toBe(0);
+
+    // Device B: the next poll pulls the revision and applies it.
+    await b.engine.syncNow();
+    expect(b.writes.length).toBe(1);
+    expect(b.writes[0].path).toBe("note.md");
+    expect(new TextDecoder().decode(b.writes[0].bytes)).toBe("# from A");
+    expect(b.state.lastRevision).toBe(1);
+    expect(b.queue.size()).toBe(0); // no echo change from the applied write
+  });
+
+  it("two devices: edits and creates propagate in both directions", async () => {
+    const server = new FakeServer();
+    const a = makeDevice(server, "dev-a", 0);
+    const b = makeDevice(server, "dev-b", 0);
+
+    // B creates a file first.
+    b.files.set("b-note.md", new TextEncoder().encode("# from B"));
+    b.watcher.track({ kind: "create", path: "b-note.md" });
+    await b.watcher.flush();
+    await b.engine.syncNow();
+
+    // A pulls it.
+    await a.engine.syncNow();
+    expect(a.writes.some((w) => w.path === "b-note.md")).toBe(true);
+
+    // A edits it; B must receive the update.
+    a.files.set("b-note.md", new TextEncoder().encode("# from B, edited on A"));
+    a.watcher.track({ kind: "modify", path: "b-note.md" });
+    await a.watcher.flush();
+    await a.engine.syncNow();
+    await b.engine.syncNow();
+    expect(b.writes.some((w) => new TextDecoder().decode(w.bytes) === "# from B, edited on A")).toBe(true);
+    expect(b.state.lastRevision).toBe(server.changes.length);
+  });
+
+  it("two devices: an empty file created on A reaches B as a zero-byte file", async () => {
+    const server = new FakeServer();
+    const a = makeDevice(server, "dev-a", 0);
+    const b = makeDevice(server, "dev-b", 0);
+
+    a.files.set("empty.md", new Uint8Array(0));
+    a.watcher.track({ kind: "create", path: "empty.md" });
+    await a.watcher.flush();
+    await a.engine.syncNow();
+    await b.engine.syncNow();
+
+    expect(b.writes.length).toBe(1);
+    expect(b.writes[0].path).toBe("empty.md");
+    expect(b.writes[0].bytes.byteLength).toBe(0);
+  });
 });
+
+/** Minimal shared server state for two-device integration tests: accepts
+ * changes in order (with per-operation receipts) and serves pulls after a
+ * cursor, mirroring the worker's revision semantics. */
+class FakeServer {
+  changes: Change[] = [];
+  private revision = 1;
+  private receipts = new Map<string, number>();
+
+  submit(c: Change, deviceId: string): { status: "accepted"; revision: number } | { status: "conflict"; serverRevision: number } {
+    const receipt = this.receipts.get(c.operationId);
+    if (receipt !== undefined) return { status: "accepted", revision: receipt };
+    const rev = this.revision++;
+    this.changes.push({ ...c, revision: rev, deviceId });
+    this.receipts.set(c.operationId, rev);
+    return { status: "accepted", revision: rev };
+  }
+
+  pull(since: number): Change[] {
+    return this.changes.filter((c) => c.revision > since);
+  }
+}
+
+/** HTTP-like transport for a device: pushes hit the shared server; pull
+ * returns everything after the device cursor. */
+class FakeServerConnection implements Connection {
+  connected = true;
+  advanceCursorOnAccept = false;
+  handlers: ConnectionCallbacks;
+
+  constructor(
+    private server: FakeServer,
+    private deviceId: string,
+    private getCursor: () => number,
+    handlers: ConnectionCallbacks,
+  ) {
+    this.handlers = handlers;
+  }
+
+  connect(): void {}
+  disconnect(): void {
+    this.connected = false;
+  }
+
+  sendChange(c: Change): boolean {
+    const result = this.server.submit(c, this.deviceId);
+    if (result.status === "accepted") {
+      this.handlers.onAccepted(c.operationId, result.revision);
+    } else {
+      this.handlers.onConflict({
+        operationId: c.operationId,
+        path: c.path,
+        serverRevision: result.serverRevision,
+      });
+    }
+    return true;
+  }
+
+  sendAck(): boolean {
+    return true;
+  }
+
+  async fetchContent(c: Change): Promise<Uint8Array<ArrayBuffer> | null> {
+    return c.payload !== undefined ? fromBase64(c.payload) : null;
+  }
+
+  async pull(): Promise<{ currentRevision: number; changes: Change[]; resyncRequired: boolean }> {
+    return { currentRevision: 0, changes: this.server.pull(this.getCursor()), resyncRequired: false };
+  }
+}
+
+interface Device {
+  state: SyncState;
+  queue: ChangeQueue;
+  watcher: VaultWatcher;
+  engine: SyncEngine;
+  files: Map<string, Uint8Array<ArrayBuffer>>;
+  writes: { path: string; bytes: Uint8Array }[];
+}
+
+/** A fully-wired device: vault stub + watcher (like the plugin's main.ts) +
+ * engine on the shared server transport. */
+function makeDevice(server: FakeServer, deviceId: string, lastRevision: number): Device {
+  const backend: SyncStateBackend = { load: async () => undefined, save: async () => undefined };
+  const state = new SyncState(backend);
+  state.save({
+    accountId: "acc",
+    vaultId: "vault",
+    deviceId,
+    deviceToken: "tok",
+    lastRevision,
+  });
+  const queue = new ChangeQueue(state);
+  const files = new Map<string, Uint8Array<ArrayBuffer>>();
+  const writes: { path: string; bytes: Uint8Array }[] = [];
+  let engine!: SyncEngine;
+  const watcher = new VaultWatcher({
+    readBytes: async (path) => {
+      const file = files.get(path);
+      return file === undefined ? null : (file.buffer.slice(file.byteOffset, file.byteOffset + file.byteLength) as ArrayBuffer);
+    },
+    getBaseRevision: () => state.lastRevision,
+    // Mirrors main.ts: captures flow through the engine so a live edit kicks
+    // an immediate sync round instead of waiting for the next poll.
+    onChange: (c) => engine.enqueueLocal(c),
+  });
+  const vault: VaultOps = {
+    write: async (path, bytes) => {
+      watcher.track({ kind: "modify", path });
+      writes.push({ path, bytes });
+      files.set(path, new Uint8Array(bytes));
+    },
+    remove: async (path) => {
+      watcher.track({ kind: "delete", path });
+      files.delete(path);
+    },
+    rename: async (oldPath, newPath) => {
+      watcher.track({ kind: "rename", path: newPath, oldPath });
+      const bytes = files.get(oldPath);
+      files.set(newPath, bytes ?? new Uint8Array(0));
+      files.delete(oldPath);
+    },
+    readFile: async (path) => files.get(path) ?? null,
+    stat: async (path) => (files.has(path) ? "file" : null),
+  };
+  engine = new SyncEngine(state, queue, watcher, vault, () => undefined, () => undefined, {
+    connectionFactory: (handlers) =>
+      new FakeServerConnection(server, deviceId, () => state.lastRevision, handlers),
+  });
+  return { state, queue, watcher, engine, files, writes };
+}
 
 let opSeq = 1000;
 function change(over: Partial<Change>): Change {

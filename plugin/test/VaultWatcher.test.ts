@@ -206,4 +206,58 @@ describe("VaultWatcher", () => {
     await watcher.flush();
     expect(changes.length).toBe(0);
   });
+
+  it("captures an empty created file as a zero-byte payload change", async () => {
+    const { ctx, changes, reads } = makeContext();
+    const watcher = new VaultWatcher(ctx);
+    reads.set("empty.md", new ArrayBuffer(0));
+    watcher.track({ kind: "create", path: "empty.md" });
+    await watcher.flush();
+    expect(changes.length).toBe(1);
+    expect(changes[0].operation).toBe("create");
+    expect(changes[0].path).toBe("empty.md");
+    expect(changes[0].payload).toBe("");
+    expect(changes[0].content).toBeUndefined();
+  });
+
+  it("retries a transient read failure and captures on the next attempt", async () => {
+    const { ctx, changes } = makeContext();
+    let attempts = 0;
+    ctx.readBytes = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("transient read error");
+      return encode("# Hello");
+    };
+    const watcher = new VaultWatcher(ctx);
+    watcher.track({ kind: "create", path: "Hello.md" });
+    await watcher.flush();
+    expect(changes.length).toBe(1);
+    expect(changes[0].operation).toBe("create");
+    expect(attempts).toBe(2);
+  });
+
+  it("drops a capture only after repeated read failures", async () => {
+    const { ctx, changes } = makeContext();
+    let attempts = 0;
+    ctx.readBytes = async () => {
+      attempts += 1;
+      throw new Error("stuck");
+    };
+    const watcher = new VaultWatcher(ctx);
+    watcher.track({ kind: "create", path: "stuck.md" });
+    await watcher.flush();
+    expect(changes.length).toBe(0);
+    expect(attempts).toBe(3);
+  });
+
+  it("consumes an expected empty write (remote empty file) without echoing", async () => {
+    const { ctx, changes, reads } = makeContext();
+    const watcher = new VaultWatcher(ctx);
+    reads.set("empty.md", new ArrayBuffer(0));
+    const sha = await sha256Hex(new Uint8Array(0));
+    watcher.expect("empty.md", "content", { sha });
+    watcher.track({ kind: "modify", path: "empty.md" });
+    await watcher.flush();
+    expect(changes.length).toBe(0);
+  });
 });

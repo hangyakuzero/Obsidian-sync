@@ -17,6 +17,7 @@ export class ReconnectModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
+    contentEl.addClass("syncvault-modal");
     contentEl.createEl("h2", { text: "Reconnect vault" });
     contentEl.createEl("p", {
       text: "Rotates this device's sync token so syncing can resume. Your files, pending changes and sync history are kept.",

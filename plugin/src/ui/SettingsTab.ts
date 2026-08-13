@@ -35,6 +35,7 @@ export class SyncVaultSettingsTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    containerEl.addClass("syncvault-settings");
     containerEl.createEl("h2", { text: "SyncVault" });
 
     new Setting(containerEl).setName("Server URL").addText((t) => {
@@ -106,8 +107,8 @@ export class SyncVaultSettingsTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Recover sync")
-      .setDesc("Last resort when the server history is unusable (e.g. old builds uploaded files without content).")
+      .setName("Recover sync — reset baseline")
+      .setDesc("Last resort when the server history is unusable (e.g. old builds uploaded files without content). This device becomes the new baseline and re-uploads all its files.")
       .addButton((b) =>
         b
           .setButtonText("Reset baseline from this device")
@@ -127,7 +128,11 @@ export class SyncVaultSettingsTab extends PluginSettingTab {
               () => this.engine.countSyncableFiles(),
             ).open();
           }),
-      )
+      );
+
+    new Setting(containerEl)
+      .setName("Recover sync — join rebuilt baseline")
+      .setDesc("Download the rebuilt baseline to this device. Local files that differ are kept as conflict copies, not deleted.")
       .addButton((b) =>
         b
           .setButtonText("Pull rebuilt baseline")

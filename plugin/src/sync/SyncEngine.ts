@@ -31,6 +31,9 @@ export interface EngineOptions {
   pollIntervalMs?: number;
   /** Durable byte snapshots; when set, uploads are served from here. */
   staging?: Staging;
+  /** How far apart two apply failures must be to count as separate strikes
+   * before sync pauses (see APPLY_STRIKE_WINDOW_MS). Injectable for tests. */
+  applyStrikeWindowMs?: number;
 }
 
 type AckResult =
@@ -48,6 +51,14 @@ const ACK_TIMEOUT_MS = 30_000;
 const CHUNKED_ACK_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 4000;
 const CONVERGE_ROUND_CAP = 10;
+/**
+ * Remote-apply failures are retried with the normal poll cadence before sync
+ * pauses. Failures closer together than this window count as one strike (a
+ * single converge round may re-try the same change several times); three
+ * spaced strikes pause once with a notice.
+ */
+const APPLY_STRIKE_WINDOW_MS = 4000;
+const MAX_APPLY_FAILURES = 3;
 /**
  * Files at or below this size travel inside the change itself as a base64
  * payload (server stores them inline); larger files upload via content chunks.
@@ -70,6 +81,13 @@ export class SyncEngine {
   private resyncBlocked = false;
   private staging?: Staging;
   private journal: Journal;
+  /** Bumped by every stop(); in-flight sync work checks it before mutating
+   * state, so an old run can never corrupt a newer one after restart/reset. */
+  private generation = 0;
+  private syncSoonTimer: ReturnType<typeof setTimeout> | null = null;
+  private applyFailureCount = 0;
+  private lastApplyFailureAt = 0;
+  private applyStrikeWindowMs: number;
 
   constructor(
     private state: SyncState,
@@ -83,6 +101,7 @@ export class SyncEngine {
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.scanner = options.scanner;
     this.staging = options.staging;
+    this.applyStrikeWindowMs = options.applyStrikeWindowMs ?? APPLY_STRIKE_WINDOW_MS;
     this.journal = new Journal(state);
     const handlers: ConnectionCallbacks = {
       onWelcome: (serverRevision, resyncRequired) => this.handleWelcome(serverRevision, resyncRequired),
@@ -93,6 +112,9 @@ export class SyncEngine {
         this.settleAck(c.operationId, { status: "conflict", conflictPath: c.conflictPath }),
       onRejected: (operationId, code, message) => this.handleRejected(operationId, code, message),
       onAuthFailure: (message) => this.handleAuthFailure(message),
+      onAuthed: () => {
+        this.consecutiveAuthFailures = 0;
+      },
       onRetry: (operationId, message) => this.handleRetry(operationId, message),
       onResyncRequired: (message) => this.handleResyncRequired(message),
       onError: (message) => this.onNotice(`SyncVault: ${message}`, 6000),
@@ -129,6 +151,7 @@ export class SyncEngine {
 
   async start(): Promise<void> {
     if (!this.state.connected) return;
+    this.generation += 1;
     this.connection.connect();
     if (this.pollTimer === null) {
       this.pollTimer = setInterval(() => void this.pollOnce(), this.pollIntervalMs);
@@ -139,16 +162,22 @@ export class SyncEngine {
   }
 
   stop(): void {
+    this.generation += 1;
     this.connection.disconnect();
     if (this.pollTimer !== null) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
+    }
+    if (this.syncSoonTimer !== null) {
+      clearTimeout(this.syncSoonTimer);
+      this.syncSoonTimer = null;
     }
     this.clearPendingAcks();
     this.syncInFlight = false;
     this.polling = false;
     this.paused = false;
     this.joinBackup = false;
+    this.applyFailureCount = 0;
     this.setStatus("idle");
   }
 
@@ -166,6 +195,8 @@ export class SyncEngine {
   async resume(): Promise<void> {
     this.paused = false;
     this.resyncBlocked = false;
+    this.applyFailureCount = 0;
+    this.lastApplyFailureAt = 0;
     if (this.statusValue === "paused" || this.statusValue === "conflict") {
       this.setStatus("syncing");
     }
@@ -190,9 +221,11 @@ export class SyncEngine {
     if (!this.state.connected) return;
     if (this.polling) return;
     if (!this.connection.connected) return;
+    const gen = this.generation;
     this.polling = true;
     try {
-      const capped = await this.converge();
+      const capped = await this.converge(gen);
+      if (gen !== this.generation) return;
       if (!capped && !this.paused) this.joinBackup = false;
       if (this.paused) return;
       if (capped) {
@@ -203,7 +236,7 @@ export class SyncEngine {
         this.setStatus(this.connection.connected ? "synced" : "offline");
       }
     } catch {
-      this.setStatus("offline");
+      if (gen === this.generation) this.setStatus("offline");
     } finally {
       this.polling = false;
     }
@@ -215,9 +248,11 @@ export class SyncEngine {
    * Self-pushed and interleaved revisions are applied in revision order; only
    * applied revisions advance the cursor.
    */
-  private async converge(): Promise<boolean> {
+  private async converge(gen: number): Promise<boolean> {
     for (let round = 0; round < CONVERGE_ROUND_CAP; round++) {
+      if (gen !== this.generation) return false;
       const result = await this.connection.pull(this.state.lastRevision);
+      if (gen !== this.generation) return false;
       if (result.resyncRequired) {
         this.handleResyncRequired(
           "local history is older than the server retention window. Resync is not supported yet.",
@@ -227,6 +262,7 @@ export class SyncEngine {
       if (result.changes.length > 0) this.setStatus("downloading");
       for (const change of result.changes) {
         await this.applyRemoteChange(change);
+        if (gen !== this.generation) return false;
         if (this.paused) return false;
       }
       await this.maybeSeed();
@@ -304,13 +340,16 @@ export class SyncEngine {
   }
 
   private async applyRemoteChange(change: Change): Promise<void> {
+    const gen = this.generation;
     if (this.statusValue === "idle") this.setStatus("downloading");
     const paths = change.oldPath ? [change.path, change.oldPath] : [change.path];
     try {
       // Local observations for these paths must reach the queue before the
       // remote write so they are never lost to overwriting.
       await this.watcher.flush();
+      if (gen !== this.generation) return;
       await this.apply(change);
+      if (gen !== this.generation) return;
       // Remember paths whose content we seeded from the server so the initial
       // scan never re-uploads them as local-only files.
       await this.state.markApplied(change.path, change.oldPath);
@@ -321,12 +360,29 @@ export class SyncEngine {
       });
     } catch (e) {
       // Never ACK an unapplied change: the cursor stays put so the change is
-      // not lost. Instead of retrying forever, pause polling and surface a
-      // single notice — resume only after the underlying issue is fixed.
+      // redelivered on the next pull. Transient failures (a momentary read
+      // error, a network blip fetching chunked content) retry with the poll
+      // cadence; only failures spaced far enough apart to be persistent pause
+      // once — a single converge round can retry the same change several
+      // times, so rapid repeats must not count as separate strikes.
+      const now = Date.now();
+      if (now - this.lastApplyFailureAt >= this.applyStrikeWindowMs) {
+        this.applyFailureCount += 1;
+      }
+      this.lastApplyFailureAt = now;
+      const message = (e as Error).message;
+      if (this.applyFailureCount < MAX_APPLY_FAILURES) {
+        this.setStatus("conflict");
+        this.onNotice(
+          `SyncVault: could not apply "${change.path}": ${message} — retrying (${this.applyFailureCount}/${MAX_APPLY_FAILURES}).`,
+          6000,
+        );
+        return;
+      }
       this.paused = true;
       this.setStatus("paused");
       this.onNotice(
-        `SyncVault: sync paused — could not apply "${change.path}": ${(e as Error).message}. Fix the issue, then resume sync (Settings → Resume).`,
+        `SyncVault: sync paused — could not apply "${change.path}": ${message}. Fix the issue, then resume sync (Settings → Resume).`,
         10000,
       );
       return;
@@ -337,6 +393,7 @@ export class SyncEngine {
       await this.state.setLastRevision(change.revision);
       this.connection.sendAck(change.revision);
     }
+    this.applyFailureCount = 0;
     if (this.queue.size() === 0) this.setStatus("synced");
   }
 
@@ -430,6 +487,24 @@ export class SyncEngine {
     } else {
       await this.queue.enqueue(change);
     }
+    // A live file edit must not wait for the next poll tick: kick a sync
+    // round as soon as the watcher's debounce has landed a change.
+    this.scheduleImmediateSync();
+  }
+
+  /**
+   * A short-coalesced prompt sync after local captures. Never runs while a
+   * poll or flush is already active (they pick the change up themselves).
+   */
+  private scheduleImmediateSync(): void {
+    if (this.paused || !this.state.connected || !this.connection.connected) return;
+    if (this.syncSoonTimer !== null) return;
+    this.syncSoonTimer = setTimeout(() => {
+      this.syncSoonTimer = null;
+      if (this.polling || this.syncInFlight || this.paused) return;
+      if (!this.connection.connected) return;
+      void this.pollOnce();
+    }, 50);
   }
 
   /**
@@ -738,6 +813,7 @@ export class SyncEngine {
     if (!this.connection.connected) return;
     if (this.resyncBlocked) return;
     if (this.syncInFlight) return;
+    const gen = this.generation;
     this.syncInFlight = true;
     this.setStatus(this.queue.size() > 0 ? "uploading" : this.statusValue);
     try {
@@ -777,7 +853,9 @@ export class SyncEngine {
             inlinePayload = toBase64(bytes);
           }
         }
+        if (gen !== this.generation) break;
         const result = await this.sendAndWait(item, inlinePayload !== undefined ? undefined : bytes, inlinePayload);
+        if (gen !== this.generation) break;
         if (result === null) break;
         if (result.status === "retry") break;
         if (result.status === "rejected") {
