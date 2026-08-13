@@ -896,7 +896,7 @@ var SyncVaultSettingsTab = class extends import_obsidian5.PluginSettingTab {
 
 // src/state/SyncState.ts
 var DEFAULT_SYNC_DATA = {
-  serverUrl: "http://localhost:8787",
+  serverUrl: "https://syncvault.hangyakuzero.workers.dev",
   lastRevision: 0,
   pendingChanges: [],
   seeded: false,
@@ -2727,7 +2727,7 @@ var SyncVaultPlugin = class extends import_obsidian6.Plugin {
       load: () => this.loadData(),
       save: (data) => this.saveData(data)
     });
-    this.client = new SyncClient("http://localhost:8787");
+    this.client = new SyncClient("https://syncvault.hangyakuzero.workers.dev");
     this.auth = new AuthManager(this.state, this.client);
     this.queue = new ChangeQueue(this.state);
     this.staging = new VaultStaging(

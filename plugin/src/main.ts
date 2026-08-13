@@ -43,7 +43,7 @@ export default class SyncVaultPlugin extends Plugin {
     load: () => this.loadData(),
     save: (data) => this.saveData(data),
   });
-  client = new SyncClient("http://localhost:8787");
+  client = new SyncClient(__SYNCVAULT_SERVER_URL__);
   auth: AuthManager = new AuthManager(this.state, this.client);
   queue = new ChangeQueue(this.state);
   staging = new VaultStaging(
