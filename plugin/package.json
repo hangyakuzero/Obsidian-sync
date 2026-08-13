@@ -1,7 +1,7 @@
 {
   "name": "@syncvault/plugin",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "SyncVault Obsidian plugin",
   "main": "main.js",
   "scripts": {
