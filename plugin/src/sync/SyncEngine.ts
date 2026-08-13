@@ -342,8 +342,19 @@ export class SyncEngine {
       // remote write so they are never lost to overwriting.
       await this.watcher.flush();
       if (gen !== this.generation) return;
-      await this.apply(change);
-      if (gen !== this.generation) return;
+      if (this.journal.proven(change.operationId)) {
+        // Echo of this device's own accepted push (HTTP redelivery) or a
+        // lost-ACK redelivery: the file already holds this exact content —
+        // never rewrite it over newer local edits.
+      } else if (this.queueTouchesPath(change)) {
+        // A newer local edit for this path is still queued for upload: the
+        // incoming revision must not stomp it. Journal and ACK anyway so the
+        // cursor advances; the queued op becomes the newest server revision
+        // once it uploads (last-write-wins).
+      } else {
+        await this.apply(change);
+        if (gen !== this.generation) return;
+      }
       // Remember paths whose content we seeded from the server so the initial
       // scan never re-uploads them as local-only files.
       await this.state.markApplied(change.path, change.oldPath);
@@ -536,6 +547,17 @@ export class SyncEngine {
     const bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
     return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  /**
+   * True when a pending local operation (still queued for upload) touches the
+   * same vault path(s) as an incoming remote change. The local edit is newer
+   * than the remote revision and wins; see applyRemoteChange.
+   */
+  private queueTouchesPath(change: Change): boolean {
+    if (this.queue.hasPath(change.path)) return true;
+    if (change.oldPath !== undefined && this.queue.hasPath(change.oldPath)) return true;
+    return false;
   }
 
   private async apply(change: Change): Promise<void> {
@@ -796,6 +818,7 @@ export class SyncEngine {
           continue;
         }
         if (result.status === "accepted") {
+          await this.recordAcceptedLocal(item, result.revision);
           await this.queue.remove(item.operationId);
           if (item.stagedFile) await this.staging?.remove(item.stagedFile);
           if (this.connection.advanceCursorOnAccept) {
@@ -819,6 +842,20 @@ export class SyncEngine {
         }
       }
     }
+  }
+
+  /**
+   * An accepted local push is recorded in the journal before its queue entry
+   * is dropped. The HTTP transport never advances the cursor on accept, so
+   * the next pull redelivers the push as an echo; the journal entry is what
+   * keeps that echo from rewriting the file over newer local edits.
+   */
+  private async recordAcceptedLocal(item: QueuedChange, revision: number): Promise<void> {
+    await this.journal.record({
+      operationId: item.operationId,
+      revision,
+      paths: item.oldPath ? [item.path, item.oldPath] : [item.path],
+    });
   }
 
   private sendAndWait(

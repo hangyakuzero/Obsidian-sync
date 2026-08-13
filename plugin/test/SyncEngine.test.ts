@@ -433,6 +433,203 @@ describe("SyncEngine", () => {
     expect(rig.conn.acks).toContain(8);
   });
 
+  it("records an accepted HTTP operation so its own echo never rewrites the file", async () => {
+    const rig = makeRig();
+    rig.conn.advanceCursorOnAccept = false;
+    await rig.queue.enqueue(
+      change({
+        operationId: "op-http",
+        path: "a.md",
+        operation: "update",
+        baseRevision: 3,
+        payload: toBase64(new TextEncoder().encode("v1")),
+      }),
+    );
+    const synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    rig.conn.handlers.onAccepted("op-http", 8);
+    await synced;
+    // The accept itself never touches the filesystem but is journaled, so the
+    // echo that arrives on the next pull cannot rewrite the file either.
+    expect(rig.writes.length).toBe(0);
+    expect(rig.state.journal.some((e) => e.operationId === "op-http")).toBe(true);
+    const echo: Change = change({
+      operationId: "op-http",
+      revision: 8,
+      path: "a.md",
+      operation: "update",
+      baseRevision: 0,
+      payload: toBase64(new TextEncoder().encode("v1")),
+    });
+    rig.conn.handlers.onRemoteChange(echo);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.writes.length).toBe(0);
+    expect(rig.conn.acks).toEqual([8]);
+    expect(rig.state.lastRevision).toBe(8);
+  });
+
+  it("does not overwrite a newer pending local edit with an older remote change", async () => {
+    const rig = makeRig();
+    // The user pressed Enter and typed more: the newer local edit is queued
+    // but not yet uploaded when an older revision of the same note arrives.
+    await rig.queue.enqueue(
+      change({
+        operationId: "op-local-2",
+        path: "note.md",
+        operation: "update",
+        baseRevision: 4,
+        payload: toBase64(new TextEncoder().encode("newer local line")),
+      }),
+    );
+    const stale: Change = change({
+      operationId: "remote-old",
+      revision: 5,
+      path: "note.md",
+      operation: "update",
+      baseRevision: 0,
+      payload: toBase64(new TextEncoder().encode("older remote content")),
+    });
+    rig.conn.handlers.onRemoteChange(stale);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.writes.length).toBe(0); // the pending local edit wins
+    expect(rig.queue.size()).toBe(1); // the local op is still queued
+    expect(rig.conn.acks).toEqual([5]); // cursor still advances
+    expect(rig.state.lastRevision).toBe(5);
+    expect(rig.state.journal.some((e) => e.operationId === "remote-old")).toBe(true);
+  });
+
+  it("preserves a pending local delete when an older remote update arrives", async () => {
+    const rig = makeRig();
+    await rig.queue.enqueue(
+      change({ operationId: "op-del", path: "bye.md", operation: "delete", baseRevision: 4 }),
+    );
+    rig.files.set("bye.md", new Uint8Array(new TextEncoder().encode("x").buffer as ArrayBuffer));
+    const stale: Change = change({
+      operationId: "remote-upd",
+      revision: 5,
+      path: "bye.md",
+      operation: "update",
+      payload: toBase64(new TextEncoder().encode("old")),
+    });
+    rig.conn.handlers.onRemoteChange(stale);
+    await new Promise((r) => setTimeout(r, 10));
+    // the deleted file must not be resurrected by the stale remote write
+    expect(rig.writes.length).toBe(0);
+    expect(rig.removes).toEqual([]);
+    expect(rig.queue.size()).toBe(1);
+    expect(rig.conn.acks).toEqual([5]);
+  });
+
+  it("preserves a pending local rename when an older remote rename arrives", async () => {
+    const rig = makeRig();
+    await rig.queue.enqueue(
+      change({
+        operationId: "op-rn",
+        path: "local.md",
+        oldPath: "tmp.md",
+        operation: "rename",
+        baseRevision: 4,
+      }),
+    );
+    const remote: Change = change({
+      operationId: "remote-rn",
+      revision: 5,
+      path: "tmp.md",
+      oldPath: "orig.md",
+      operation: "rename",
+    });
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.renames).toEqual([]);
+    expect(rig.queue.size()).toBe(1);
+    expect(rig.conn.acks).toEqual([5]);
+    expect(rig.state.lastRevision).toBe(5);
+  });
+
+  it("rapid local edits survive the pull of an earlier accepted revision", async () => {
+    const rig = makeRig();
+    rig.conn.advanceCursorOnAccept = false;
+    await rig.queue.enqueue(
+      change({
+        operationId: "op-1",
+        path: "note.md",
+        operation: "update",
+        baseRevision: 4,
+        payload: toBase64(new TextEncoder().encode("line one")),
+      }),
+    );
+    let synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    rig.conn.handlers.onAccepted("op-1", 5);
+    await synced;
+    // The user keeps typing: a second edit lands before the echo of op-1 is
+    // pulled. The echo must not write the older line over the newer file.
+    await rig.queue.enqueue(
+      change({
+        operationId: "op-2",
+        path: "note.md",
+        operation: "update",
+        baseRevision: 5,
+        payload: toBase64(new TextEncoder().encode("line two")),
+      }),
+    );
+    const echo1: Change = change({
+      operationId: "op-1",
+      revision: 5,
+      path: "note.md",
+      operation: "update",
+      baseRevision: 4,
+      payload: toBase64(new TextEncoder().encode("line one")),
+    });
+    rig.conn.handlers.onRemoteChange(echo1);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.writes.length).toBe(0);
+    expect(rig.queue.size()).toBe(1); // op-2 is untouched
+    expect(rig.state.lastRevision).toBe(5);
+    // op-2 uploads; its own echo must also never write.
+    synced = rig.engine.syncNow();
+    await new Promise((r) => setTimeout(r, 10));
+    rig.conn.handlers.onAccepted("op-2", 6);
+    await synced;
+    const echo2: Change = change({
+      operationId: "op-2",
+      revision: 6,
+      path: "note.md",
+      operation: "update",
+      baseRevision: 5,
+      payload: toBase64(new TextEncoder().encode("line two")),
+    });
+    rig.conn.handlers.onRemoteChange(echo2);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.writes.length).toBe(0);
+    expect(rig.state.lastRevision).toBe(6);
+  });
+
+  it("applies remote changes for paths with no pending local edits", async () => {
+    const rig = makeRig();
+    await rig.queue.enqueue(
+      change({
+        operationId: "op-local",
+        path: "mine.md",
+        operation: "update",
+        baseRevision: 4,
+        payload: toBase64(new TextEncoder().encode("local")),
+      }),
+    );
+    const remote: Change = change({
+      operationId: "remote-other",
+      revision: 5,
+      path: "theirs.md",
+      operation: "update",
+      payload: toBase64(new TextEncoder().encode("remote")),
+    });
+    rig.conn.handlers.onRemoteChange(remote);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(rig.writes.length).toBe(1);
+    expect(rig.writes[0].path).toBe("theirs.md");
+    expect(new TextDecoder().decode(rig.writes[0].bytes)).toBe("remote");
+  });
+
   it("refreshes a stale content descriptor and sends small files inline", async () => {
     const rig = makeRig();
     const bytes = new TextEncoder().encode("v1").buffer as ArrayBuffer;
